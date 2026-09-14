@@ -27,7 +27,7 @@ Règle stricte de recherche pour ajouter un aliment, tu dois procéder dans cet 
 4. Une fois le bon aliment trouvé, utilise 'sparky_manage_food' pour l'ajouter avec la bonne quantité.
 Ne pose pas de questions, exécute les recherches silencieusement et logue le repas.`;
 
-// Définition des 3 outils strictement nécessaires (garde le payload LLM très léger)
+// Définition des 3 outils strictement nécessaires
 const tools = [
   {
     type: "function",
@@ -79,18 +79,19 @@ const tools = [
   }
 ];
 
-// Fonction utilitaire pour appeler le backend MCP de SparkyFitness
-async function callSparkyMCP(toolName, parsedArguments) {
+// Fonction utilitaire avec ajout de l'ID pour exiger une réponse du serveur
+async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
   const mcpResponse = await fetch(`${SPARKY_API_URL}/mcp`, {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${SPARKY_API_KEY}`,
       'Content-Type': 'application/json',
       'mcp-protocol-version': '2024-11-05',
-      'Accept': 'application/json, text/event-stream' // <-- LA LIGNE À AJOUTER
+      'Accept': 'application/json'
     },
     body: JSON.stringify({
       jsonrpc: "2.0",
+      id: toolCallId, // <-- LE CHAMP MANQUANT
       method: "tools/call",
       params: { name: toolName, arguments: parsedArguments }
     })
@@ -108,7 +109,6 @@ bot.on('text', async (ctx) => {
     const userMessage = ctx.message.text;
     await ctx.sendChatAction('typing');
 
-    // Initialisation de la conversation avec le Prompt Système
     let messages = [
       { role: "system", content: SYSTEM_PROMPT },
       { role: "user", content: `Logue ce repas : ${userMessage}` }
@@ -117,10 +117,9 @@ bot.on('text', async (ctx) => {
     let isDone = false;
     let finalReply = "✅ Repas traité avec succès !";
 
-    // Boucle Agentique (Max 5 itérations pour éviter les boucles infinies)
     for (let i = 0; i < 5 && !isDone; i++) {
       const completion = await openai.chat.completions.create({
-        model: "gemini-2.5-flash", // Recommandé pour des tâches rapides de Tool Calling
+        model: "gemini-2.5-flash",
         messages: messages,
         tools: tools,
         tool_choice: "auto"
@@ -129,28 +128,25 @@ bot.on('text', async (ctx) => {
       const responseMessage = completion.choices[0].message;
       messages.push(responseMessage);
 
-      // Si Gemini ne veut plus utiliser d'outil, on sort de la boucle
       if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
         if (responseMessage.content) finalReply = responseMessage.content;
         isDone = true;
         break;
       }
 
-      // Traitement de chaque appel d'outil demandé par Gemini
       for (const toolCall of responseMessage.tool_calls) {
         const parsedArgs = JSON.parse(toolCall.function.arguments);
         
-        // Appel au Cloud Run principal de SparkyFitness
-        const mcpResult = await callSparkyMCP(toolCall.function.name, parsedArgs);
+        // On passe l'ID de l'outil généré par Gemini pour la requête JSON-RPC
+        const mcpResult = await callSparkyMCP(toolCall.id, toolCall.function.name, parsedArgs);
 
-        // On donne le résultat de la recherche à Gemini pour qu'il continue sa réflexion
         messages.push({
           role: "tool",
           tool_call_id: toolCall.id,
-          content: JSON.stringify(mcpResult)
+          // MCP renvoie le résultat dans mcpResult.result
+          content: JSON.stringify(mcpResult.result || mcpResult)
         });
 
-        // Si l'outil appelé était l'ajout final, on peut s'arrêter
         if (toolCall.function.name === "sparky_manage_food") {
           isDone = true;
         }
