@@ -81,13 +81,13 @@ const tools = [
 
 // Fonction utilitaire pour appeler le backend MCP de SparkyFitness
 async function callSparkyMCP(toolName, parsedArguments) {
-  // CORRECTION : Appel sur /mcp au lieu de /api/mcp
   const mcpResponse = await fetch(`${SPARKY_API_URL}/mcp`, {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${SPARKY_API_KEY}`,
       'Content-Type': 'application/json',
-      'mcp-protocol-version': '2024-11-05' // Header recommandé par le protocole MCP
+      'mcp-protocol-version': '2024-11-05',
+      'Accept': 'application/json, text/event-stream' // <-- LA LIGNE À AJOUTER
     },
     body: JSON.stringify({
       jsonrpc: "2.0",
@@ -96,7 +96,10 @@ async function callSparkyMCP(toolName, parsedArguments) {
     })
   });
 
-  if (!mcpResponse.ok) throw new Error(`Erreur MCP: ${mcpResponse.statusText}`);
+  if (!mcpResponse.ok) {
+    const errText = await mcpResponse.text();
+    throw new Error(`Erreur MCP (${mcpResponse.status}): ${errText}`);
+  }
   return await mcpResponse.json();
 }
 
