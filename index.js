@@ -159,7 +159,7 @@ bot.on('text', async (ctx) => {
   }
 });
 
-const webhookPath = `/telegraf/${bot.secretPathComponent()}`;
+const webhookPath = '/telegram-webhook';
 app.post(webhookPath, (req, res, next) => {
   bot.handleUpdate(req.body, res).then(() => {
     if (!res.headersSent) res.sendStatus(200);
