@@ -1,6 +1,7 @@
 const express = require('express');
 const { Telegraf } = require('telegraf');
 const OpenAI = require('openai');
+const axios = require('axios'); // <-- Ajout de Axios
 
 const app = express();
 app.use(express.json());
@@ -10,17 +11,16 @@ const SPARKY_API_URL = process.env.SPARKY_API_URL;
 const SPARKY_API_KEY = process.env.SPARKY_API_KEY;
 const PORT = process.env.PORT || 8080;
 
+// Désactivation de la réponse webhook automatique pour empêcher Cloud Run de geler le CPU
 const bot = new Telegraf(TELEGRAM_TOKEN, {
   telegram: { webhookReply: false }
 });
 
-// Configuration du SDK OpenAI pour utiliser l'API Gemini de Google
 const openai = new OpenAI({ 
   apiKey: process.env.GEMINI_API_KEY,
   baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/"
 });
 
-// Le Prompt Système qui dicte ta logique de repli
 const SYSTEM_PROMPT = `Tu es l'assistant nutritionnel personnel de l'utilisateur pour SparkyFitness.
 Règle stricte de recherche pour ajouter un aliment, tu dois procéder dans cet ordre EXACT :
 1. Utilise 'sparky_get_favorite_foods' pour vérifier si l'aliment est dans les favoris de l'utilisateur.
@@ -29,7 +29,6 @@ Règle stricte de recherche pour ajouter un aliment, tu dois procéder dans cet 
 4. Une fois le bon aliment trouvé, utilise 'sparky_manage_food' pour l'ajouter avec la bonne quantité.
 Ne pose pas de questions, exécute les recherches silencieusement et logue le repas.`;
 
-// Définition des 3 outils strictement nécessaires
 const tools = [
   {
     type: "function",
@@ -81,29 +80,32 @@ const tools = [
   }
 ];
 
-// Fonction utilitaire avec ajout de l'ID pour exiger une réponse du serveur
+// Appel au serveur MCP via Axios pour forcer le respect des headers
 async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
-  const mcpResponse = await fetch(`${SPARKY_API_URL}/mcp`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${SPARKY_API_KEY}`,
-      'Content-Type': 'application/json',
-      'mcp-protocol-version': '2024-11-05',
-      'Accept': 'application/json'
-    },
-    body: JSON.stringify({
+  try {
+    const response = await axios.post(`${SPARKY_API_URL}/mcp`, {
       jsonrpc: "2.0",
-      id: toolCallId, // <-- LE CHAMP MANQUANT
+      id: toolCallId,
       method: "tools/call",
       params: { name: toolName, arguments: parsedArguments }
-    })
-  });
+    }, {
+      headers: {
+        'Authorization': `Bearer ${SPARKY_API_KEY}`,
+        'Content-Type': 'application/json',
+        'mcp-protocol-version': '2024-11-05',
+        // Contournement de la restriction stricte de l'adaptateur MCP
+        'Accept': 'application/json, text/event-stream'
+      }
+    });
 
-  if (!mcpResponse.ok) {
-    const errText = await mcpResponse.text();
-    throw new Error(`Erreur MCP (${mcpResponse.status}): ${errText}`);
+    return response.data;
+  } catch (error) {
+    const status = error.response ? error.response.status : 'Unknown';
+    const message = error.response && error.response.data 
+      ? JSON.stringify(error.response.data) 
+      : error.message;
+    throw new Error(`Erreur MCP (${status}): ${message}`);
   }
-  return await mcpResponse.json();
 }
 
 bot.on('text', async (ctx) => {
@@ -139,13 +141,11 @@ bot.on('text', async (ctx) => {
       for (const toolCall of responseMessage.tool_calls) {
         const parsedArgs = JSON.parse(toolCall.function.arguments);
         
-        // On passe l'ID de l'outil généré par Gemini pour la requête JSON-RPC
         const mcpResult = await callSparkyMCP(toolCall.id, toolCall.function.name, parsedArgs);
 
         messages.push({
           role: "tool",
           tool_call_id: toolCall.id,
-          // MCP renvoie le résultat dans mcpResult.result
           content: JSON.stringify(mcpResult.result || mcpResult)
         });
 
