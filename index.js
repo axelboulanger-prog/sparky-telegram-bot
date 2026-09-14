@@ -10,7 +10,9 @@ const SPARKY_API_URL = process.env.SPARKY_API_URL;
 const SPARKY_API_KEY = process.env.SPARKY_API_KEY;
 const PORT = process.env.PORT || 8080;
 
-const bot = new Telegraf(TELEGRAM_TOKEN);
+const bot = new Telegraf(TELEGRAM_TOKEN, {
+  telegram: { webhookReply: false }
+});
 
 // Configuration du SDK OpenAI pour utiliser l'API Gemini de Google
 const openai = new OpenAI({ 
