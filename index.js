@@ -1,8 +1,6 @@
 const express = require('express');
 const { Telegraf } = require('telegraf');
 const OpenAI = require('openai');
-const { Client } = require("@modelcontextprotocol/sdk/client/index.js");
-const { SSEClientTransport } = require("@modelcontextprotocol/sdk/client/sse.js");
 
 const app = express();
 app.use(express.json());
@@ -12,7 +10,7 @@ const SPARKY_API_URL = process.env.SPARKY_API_URL;
 const SPARKY_API_KEY = process.env.SPARKY_API_KEY;
 const PORT = process.env.PORT || 8080;
 
-// Désactivation de la réponse webhook automatique pour empêcher Cloud Run de geler le CPU
+// Désactivation de la réponse webhook pour empêcher Cloud Run de geler le CPU
 const bot = new Telegraf(TELEGRAM_TOKEN, {
   telegram: { webhookReply: false }
 });
@@ -24,11 +22,11 @@ const openai = new OpenAI({
 
 const SYSTEM_PROMPT = `Tu es l'assistant nutritionnel personnel de l'utilisateur pour SparkyFitness.
 Règle stricte de recherche pour ajouter un aliment, tu dois procéder dans cet ordre EXACT :
-1. Utilise 'sparky_get_favorite_foods' pour vérifier si l'aliment est dans les favoris de l'utilisateur.
-2. Si non trouvé, utilise 'sparky_search_food' pour chercher dans sa base locale (qui contient l'import Ciqual).
-3. Si toujours non trouvé, utilise 'sparky_search_food' pour chercher spécifiquement dans OpenFoodFacts ou SwissFood.
-4. Une fois le bon aliment trouvé, utilise 'sparky_manage_food' pour l'ajouter avec la bonne quantité.
-Ne pose pas de questions, exécute les recherches silencieusement et logue le repas.`;
+1. Utilise 'sparky_get_favorite_foods' pour vérifier si l'aliment est dans les favoris.
+2. Si non trouvé, utilise 'sparky_search_food' pour chercher dans sa base locale.
+3. Si toujours non trouvé, utilise 'sparky_search_food' pour chercher dans OpenFoodFacts ou SwissFood.
+4. Une fois trouvé, utilise 'sparky_manage_food' pour l'ajouter avec la bonne quantité.
+Exécute les recherches silencieusement et logue le repas.`;
 
 const tools = [
   {
@@ -81,53 +79,30 @@ const tools = [
   }
 ];
 
-// Configuration du client MCP
-let mcpClient = null;
-
-async function initMCPClient() {
-  if (mcpClient) return mcpClient;
-
-  // L'endpoint MCP de SparkyFitness est monté sur /mcp.
-  // Note: Si le serveur utilise StreamableHTTPServerTransport sur la racine, 
-  // l'URL SSE standard est souvent /sse ou la racine elle-même.
-  const sseUrl = new URL(`${SPARKY_API_URL}/mcp`);
-
-  const transport = new SSEClientTransport(sseUrl, {
+// Appel stateless strict respectant les exigences de StreamableHTTPServerTransport
+async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
+  const mcpResponse = await fetch(`${SPARKY_API_URL}/mcp`, {
+    method: 'POST',
     headers: {
-      'Authorization': `Bearer ${SPARKY_API_KEY}`
-    }
+      'Authorization': `Bearer ${SPARKY_API_KEY}`,
+      'Content-Type': 'application/json',
+      'mcp-protocol-version': '2024-11-05',
+      'Accept': 'application/json, text/event-stream' // <-- Le header bloquant
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: toolCallId, // <-- L'ID obligatoire pour avoir une réponse
+      method: "tools/call",
+      params: { name: toolName, arguments: parsedArguments }
+    })
   });
 
-  const client = new Client(
-    { name: "sparky-telegram-bot", version: "1.0.0" },
-    { capabilities: { tools: {} } }
-  );
-
-  try {
-    await client.connect(transport);
-    console.log("Connecté au serveur MCP SparkyFitness");
-    mcpClient = client;
-    return client;
-  } catch (error) {
-    console.error("Échec de la connexion initiale au serveur MCP:", error);
-    throw error;
+  if (!mcpResponse.ok) {
+    const errText = await mcpResponse.text();
+    throw new Error(`Erreur MCP (${mcpResponse.status}): ${errText}`);
   }
-}
-
-async function callSparkyMCP(toolName, parsedArguments) {
-  try {
-    const client = await initMCPClient();
-    const result = await client.callTool({
-      name: toolName,
-      arguments: parsedArguments
-    });
-    return result;
-  } catch (error) {
-    console.error(`Erreur d'appel outil MCP [${toolName}]:`, error);
-    // En cas d'erreur de connexion, on réinitialise le client pour la prochaine tentative
-    mcpClient = null; 
-    throw error;
-  }
+  
+  return await mcpResponse.json();
 }
 
 bot.on('text', async (ctx) => {
@@ -163,14 +138,13 @@ bot.on('text', async (ctx) => {
       for (const toolCall of responseMessage.tool_calls) {
         const parsedArgs = JSON.parse(toolCall.function.arguments);
         
-        // On utilise la nouvelle fonction callSparkyMCP qui gère le client MCP
-        const mcpResult = await callSparkyMCP(toolCall.function.name, parsedArgs);
+        const mcpResult = await callSparkyMCP(toolCall.id, toolCall.function.name, parsedArgs);
 
         messages.push({
           role: "tool",
           tool_call_id: toolCall.id,
-          // Le SDK renvoie un objet avec une propriété 'content'
-          content: JSON.stringify(mcpResult.content || mcpResult)
+          // Le serveur MCP SparkyFitness renvoie le résultat dans la propriété 'result'
+          content: JSON.stringify(mcpResult.result || mcpResult)
         });
 
         if (toolCall.function.name === "sparky_manage_food") {
