@@ -10,7 +10,7 @@ const SPARKY_API_URL = process.env.SPARKY_API_URL;
 const SPARKY_API_KEY = process.env.SPARKY_API_KEY;
 const PORT = process.env.PORT || 8080;
 
-// webhookReply: false maintient le Webhook ouvert pour éviter que Cloud Run ne gèle le CPU
+// webhookReply: false maintient la requête HTTP ouverte sur Cloud Run
 const bot = new Telegraf(TELEGRAM_TOKEN, {
   telegram: { webhookReply: false }
 });
@@ -20,30 +20,28 @@ const openai = new OpenAI({
   baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/"
 });
 
+// Cache d'idempotence
 const processedUpdates = new Set();
 
-// LE NOUVEAU PROMPT : Oblige Gemini à utiliser le nom exact de l'outil du backend
 const SYSTEM_PROMPT = `Tu es l'assistant nutritionnel personnel de l'utilisateur pour SparkyFitness.
-Règle stricte de recherche pour ajouter un aliment, tu dois procéder dans cet ordre EXACT :
-1. Utilise 'sparky_manage_favorites' avec l'action 'list_favorites' pour vérifier si l'aliment est dans les favoris.
-2. Si non trouvé, utilise 'sparky_search_food' pour chercher dans sa base locale.
-3. Si toujours non trouvé, utilise 'sparky_search_food' pour chercher dans OpenFoodFacts ou SwissFood.
-4. Une fois trouvé, utilise 'sparky_manage_food' pour l'ajouter avec la bonne quantité.
-Exécute les recherches silencieusement et logue le repas.`;
+Pour ajouter un aliment, procède dans cet ordre :
+1. Utilise 'sparky_manage_favorites' avec l'action 'list_favorites' pour chercher dans les favoris.
+2. Si non trouvé, utilise 'sparky_search_food' pour chercher.
+3. Utilise 'sparky_manage_food' pour loguer le repas. L'action est généralement 'log_food' ou 'add'. 
+IMPORTANT : Analyse le retour des outils. Si un outil renvoie une "Error", lis les champs attendus et relance l'outil avec les bons paramètres. Confirme à l'utilisateur uniquement quand l'ajout a réussi.`;
 
-// LES BONS OUTILS : Strictement alignés sur les schémas Zod de SparkyFitnessServer
+// Schémas Zod assouplis pour faciliter l'auto-correction par le LLM
 const tools = [
   {
     type: "function",
     function: {
-      name: "sparky_manage_favorites", // Le nom exact côté backend
-      description: "Gère les favoris de l'utilisateur. Utilise l'action 'list_favorites' pour récupérer la liste des aliments favoris.",
+      name: "sparky_manage_favorites",
+      description: "Gère les favoris. Utilise l'action 'list_favorites' pour récupérer la liste.",
       parameters: { 
         type: "object", 
         properties: {
-          action: { type: "string", enum: ["list_favorites", "add_favorite", "remove_favorite"] },
-          type: { type: "string", enum: ["food", "meal"] },
-          id: { type: "string" }
+          action: { type: "string" },
+          type: { type: "string" }
         }, 
         required: ["action"] 
       }
@@ -53,11 +51,11 @@ const tools = [
     type: "function",
     function: {
       name: "sparky_search_food",
-      description: "Recherche un aliment dans la base de données ou via des fournisseurs externes.",
+      description: "Recherche un aliment.",
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string", description: "Le nom de l'aliment à chercher" }
+          query: { type: "string" }
         },
         required: ["query"]
       }
@@ -67,21 +65,21 @@ const tools = [
     type: "function",
     function: {
       name: "sparky_manage_food",
-      description: "Ajoute l'aliment final dans le journal de l'utilisateur.",
+      description: "Ajoute l'aliment final dans le journal. Assure-toi d'inclure le food_id si tu l'as trouvé.",
       parameters: {
         type: "object",
         properties: {
-          action: { type: "string", enum: ["add"] },
+          action: { type: "string", description: "L'action à effectuer (ex: log_food)" },
           items: {
             type: "array",
             items: {
               type: "object",
               properties: {
-                food_name: { type: "string" }, // snake_case obligatoire
+                food_id: { type: "string" },
+                food_name: { type: "string" },
                 quantity: { type: "number" },
                 unit: { type: "string" }
-              },
-              required: ["food_name", "quantity"]
+              }
             }
           }
         },
@@ -91,7 +89,7 @@ const tools = [
   }
 ];
 
-// Parseur SSE ultra-robuste adapté à Cloud Run et au Model Context Protocol
+// Extracteur SSE robuste pour Cloud Run
 async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
   const mcpResponse = await fetch(`${SPARKY_API_URL}/mcp`, {
     method: 'POST',
@@ -115,56 +113,37 @@ async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
     throw new Error(`Erreur MCP HTTP ${mcpResponse.status}: ${responseText}`);
   }
 
-  // SparkyFitnessServer répond avec un flux d'événements (SSE)
-  const lines = responseText.split('\n');
-  let currentData = [];
-
-  for (const line of lines) {
-    if (line.startsWith('data:')) {
-      // On retire "data:" et le premier espace pour nettoyer le JSON
-      currentData.push(line.replace(/^data:\s?/, ''));
-    } else if (line.trim() === '') {
-      // Une ligne vide marque la fin d'un bloc d'événement
-      if (currentData.length > 0) {
-        const payload = currentData.join('\n');
-        try {
-          const parsed = JSON.parse(payload);
-          // On s'assure de retourner la réponse JSON-RPC
-          if (parsed.jsonrpc === "2.0") return parsed;
-        } catch (e) {
-          // Ignore les erreurs de parse sur les événements partiels
-        }
-        currentData = []; // Réinitialisation pour le prochain bloc
+  const events = responseText.split('\n\n');
+  for (const eventBlock of events) {
+    const lines = eventBlock.split('\n');
+    let dataPayload = "";
+    for (const line of lines) {
+      if (line.startsWith('data:')) {
+        dataPayload += line.substring(5).trim();
       }
+    }
+    if (dataPayload) {
+      try {
+        const parsed = JSON.parse(dataPayload);
+        if (parsed.jsonrpc === "2.0") return parsed;
+      } catch (e) {}
     }
   }
 
-  // Cas où le backend coupe la connexion sans ligne vide à la fin
-  if (currentData.length > 0) {
-    const payload = currentData.join('\n');
-    try {
-      const parsed = JSON.parse(payload);
-      if (parsed.jsonrpc === "2.0") return parsed;
-    } catch (e) {}
-  }
-
-  // Repli si le backend a envoyé un JSON pur (sans SSE)
   try {
     return JSON.parse(responseText);
   } catch (e) {
-    throw new Error(`Aucune réponse JSON-RPC trouvée.\nPayload reçu: ${responseText.substring(0, 150)}...`);
+    throw new Error(`Aucune réponse JSON-RPC trouvée.\nPayload: ${responseText.substring(0, 150)}...`);
   }
 }
 
 bot.on('text', async (ctx) => {
   const updateId = ctx.update.update_id;
-
-  // Anti-doublon en mémoire RAM
   if (processedUpdates.has(updateId)) return;
+  
   processedUpdates.add(updateId);
   if (processedUpdates.size > 500) {
-    const firstItem = processedUpdates.values().next().value;
-    processedUpdates.delete(firstItem);
+    processedUpdates.delete(processedUpdates.values().next().value);
   }
 
   try {
@@ -173,13 +152,14 @@ bot.on('text', async (ctx) => {
 
     let messages = [
       { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: `Logue ce repas : ${userMessage}` }
+      { role: "user", content: userMessage }
     ];
 
     let isDone = false;
-    let finalReply = "✅ Repas traité avec succès !";
+    // On ne code plus le message de succès en dur ! Gemini le génèrera lui-même.
+    let finalReply = "Traitement terminé.";
 
-    for (let i = 0; i < 5 && !isDone; i++) {
+    for (let i = 0; i < 6 && !isDone; i++) {
       const completion = await openai.chat.completions.create({
         model: "gemini-2.5-flash",
         messages: messages,
@@ -190,6 +170,7 @@ bot.on('text', async (ctx) => {
       const responseMessage = completion.choices[0].message;
       messages.push(responseMessage);
 
+      // Si Gemini n'appelle plus d'outil, il a généré sa réponse finale (succès ou échec)
       if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
         if (responseMessage.content) finalReply = responseMessage.content;
         isDone = true;
@@ -200,26 +181,36 @@ bot.on('text', async (ctx) => {
         const parsedArgs = JSON.parse(toolCall.function.arguments);
         console.log(`[MCP] Appel de l'outil ${toolCall.function.name}...`);
         
-        const mcpResult = await callSparkyMCP(toolCall.id, toolCall.function.name, parsedArgs);
+        try {
+          const mcpResult = await callSparkyMCP(toolCall.id, toolCall.function.name, parsedArgs);
 
-        // Traduction de l'enveloppe complexe de SparkyFitnessServer pour l'IA
-        let toolResponseText = "";
-        if (mcpResult.result && mcpResult.result.content && mcpResult.result.content.length > 0) {
-          toolResponseText = mcpResult.result.content[0].text;
-        } else if (mcpResult.error) {
-          toolResponseText = `Error: ${mcpResult.error.message}`;
-        } else {
-          toolResponseText = JSON.stringify(mcpResult);
-        }
+          let toolResponseText = "";
+          if (mcpResult.result && mcpResult.result.content && mcpResult.result.content.length > 0) {
+            toolResponseText = mcpResult.result.content[0].text;
+          } else if (mcpResult.error) {
+            toolResponseText = `Error: ${mcpResult.error.message}`;
+          } else {
+            toolResponseText = JSON.stringify(mcpResult);
+          }
 
-        messages.push({
-          role: "tool",
-          tool_call_id: toolCall.id,
-          content: toolResponseText 
-        });
+          if (toolResponseText.startsWith('Error')) {
+            console.log(`[Erreur Backend] L'outil ${toolCall.function.name} a renvoyé : ${toolResponseText}`);
+          }
 
-        if (toolCall.function.name === "sparky_manage_food") {
-          isDone = true;
+          // On donne la VRAIE réponse à l'IA pour qu'elle comprenne ce qu'il s'est passé
+          messages.push({
+            role: "tool",
+            tool_call_id: toolCall.id,
+            content: toolResponseText 
+          });
+
+        } catch (mcpError) {
+          console.error("[Erreur MCP]", mcpError);
+          messages.push({
+            role: "tool",
+            tool_call_id: toolCall.id,
+            content: `Error: ${mcpError.message}`
+          });
         }
       }
     }
@@ -227,7 +218,7 @@ bot.on('text', async (ctx) => {
     await ctx.reply(finalReply);
   } catch (error) {
     console.error("Erreur du bot:", error);
-    await ctx.reply("❌ Une erreur est survenue lors de la synchronisation avec SparkyFitness.");
+    await ctx.reply("❌ Une erreur est survenue lors de la synchronisation.");
   }
 });
 
@@ -241,6 +232,6 @@ app.post('/telegram-webhook', async (req, res, next) => {
   }
 });
 
-app.get('/', (req, res) => res.send('Bot Telegram Actif (Version Corrigée)'));
+app.get('/', (req, res) => res.send('Bot Telegram Sparky avec Agent Autonome Actif !'));
 
-app.listen(PORT, () => console.log(`Microservice démarré sur le port ${PORT}`));
+app.listen(PORT, () => console.log(`Microservice Telegram démarré sur le port ${PORT}`));
