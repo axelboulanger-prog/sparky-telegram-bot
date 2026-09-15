@@ -82,7 +82,7 @@ const tools = [
   }
 ];
 
-// Appel Stateless ultra-optimisé avec lecture de flux (SSE)
+// Appel Stateless ultra-optimisé avec lecture de flux (SSE) multi-lignes
 async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
   const abortController = new AbortController();
 
@@ -92,7 +92,7 @@ async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
       'Authorization': `Bearer ${SPARKY_API_KEY}`,
       'Content-Type': 'application/json',
       'mcp-protocol-version': '2024-11-05',
-      'Accept': 'application/json, text/event-stream' // Requis par SparkyFitnessServer
+      'Accept': 'application/json, text/event-stream' 
     },
     body: JSON.stringify({
       jsonrpc: "2.0",
@@ -104,7 +104,8 @@ async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
   });
 
   if (!mcpResponse.ok) {
-    throw new Error(`Erreur MCP HTTP ${mcpResponse.status}`);
+    const errText = await mcpResponse.text();
+    throw new Error(`Erreur MCP HTTP ${mcpResponse.status}: ${errText}`);
   }
 
   // Lecture manuelle du flux Server-Sent Events
@@ -118,21 +119,25 @@ async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
       if (done) break;
       
       buffer += decoder.decode(value, { stream: true });
-      const events = buffer.split('\n\n');
-      buffer = events.pop() || ''; // Garde le dernier morceau incomplet
+      const blocks = buffer.split('\n\n');
+      buffer = blocks.pop() || ''; // Garde le dernier morceau incomplet
 
-      for (const event of events) {
-        if (event.startsWith('data: ')) {
-          const dataStr = event.slice(6);
-          try {
-            const parsed = JSON.parse(dataStr);
-            // Dès qu'on reçoit la réponse de notre outil, on coupe la connexion !
-            if (parsed.id === toolCallId) {
-              abortController.abort(); // Tue la connexion pour libérer Cloud Run
-              return parsed;
+      for (const block of blocks) {
+        // Découpe le bloc en lignes pour ignorer "event: message" et cibler "data:"
+        const lines = block.split('\n');
+        for (const line of lines) {
+          if (line.startsWith('data:')) {
+            const dataStr = line.slice(5).trim();
+            try {
+              const parsed = JSON.parse(dataStr);
+              // Dès qu'on reçoit la réponse de notre outil, on coupe la connexion !
+              if (parsed.id === toolCallId) {
+                abortController.abort(); // Tue la connexion pour libérer Cloud Run
+                return parsed;
+              }
+            } catch (e) {
+              // Ignore les erreurs de parsing sur les événements partiels
             }
-          } catch (e) {
-            // Ignore les erreurs de parsing sur les événements partiels
           }
         }
       }
