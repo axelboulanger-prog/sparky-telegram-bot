@@ -5,12 +5,13 @@ const OpenAI = require('openai');
 const app = express();
 app.use(express.json());
 
+// Variables d'environnement injectées via Google Cloud Run
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const SPARKY_API_URL = process.env.SPARKY_API_URL; 
+const SPARKY_API_URL = process.env.SPARKY_API_URL; // Ex: https://api-xxx-uc.a.run.app
 const SPARKY_API_KEY = process.env.SPARKY_API_KEY;
 const PORT = process.env.PORT || 8080;
 
-// webhookReply: false maintient la requête HTTP ouverte sur Cloud Run
+// webhookReply: false maintient la requête HTTP ouverte sur Cloud Run (évite les timeouts Telegram)
 const bot = new Telegraf(TELEGRAM_TOKEN, {
   telegram: { webhookReply: false }
 });
@@ -20,7 +21,7 @@ const openai = new OpenAI({
   baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/"
 });
 
-// Cache d'idempotence
+// Cache d'idempotence pour éviter de traiter 2 fois le même message Telegram
 const processedUpdates = new Set();
 
 const SYSTEM_PROMPT = `Tu es l'assistant nutritionnel personnel de l'utilisateur pour SparkyFitness.
@@ -28,9 +29,13 @@ Pour ajouter un aliment, procède dans cet ordre :
 1. Utilise 'sparky_manage_favorites' avec l'action 'list_favorites' pour chercher dans les favoris.
 2. Si non trouvé, utilise 'sparky_search_food' pour chercher.
 3. Utilise 'sparky_manage_food' pour loguer le repas. L'action est généralement 'log_food' ou 'add'. 
+
+Règle stricte pour sparky_manage_food : 
+Traduis ou insère systématiquement le type de repas demandé (ex: collation, breakfast, lunch, dinner, snack) dans le paramètre "meal_type".
+
 IMPORTANT : Analyse le retour des outils. Si un outil renvoie une "Error", lis les champs attendus et relance l'outil avec les bons paramètres. Confirme à l'utilisateur uniquement quand l'ajout a réussi.`;
 
-// Schémas Zod assouplis pour faciliter l'auto-correction par le LLM
+// Schémas des outils MCP assouplis pour l'Agent Autonome
 const tools = [
   {
     type: "function",
@@ -51,7 +56,7 @@ const tools = [
     type: "function",
     function: {
       name: "sparky_search_food",
-      description: "Recherche un aliment.",
+      description: "Recherche un aliment par mot-clé.",
       parameters: {
         type: "object",
         properties: {
@@ -78,7 +83,9 @@ const tools = [
                 food_id: { type: "string" },
                 food_name: { type: "string" },
                 quantity: { type: "number" },
-                unit: { type: "string" }
+                unit: { type: "string" },
+                // Ajout crucial pour SparkyFitnessServer :
+                meal_type: { type: "string", description: "Le type de repas cible (ex: collation, breakfast, lunch, dinner)" }
               }
             }
           }
@@ -89,8 +96,9 @@ const tools = [
   }
 ];
 
-// Extracteur SSE robuste pour Cloud Run
+// Extracteur SSE robuste pour communiquer avec l'API Principale SparkyFitness
 async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
+  // L'appel POST est dirigé vers la route /mcp du backend Cloud Run (qui contourne l'intercepteur /api/auth normal)
   const mcpResponse = await fetch(`${SPARKY_API_URL}/mcp`, {
     method: 'POST',
     headers: {
@@ -113,6 +121,7 @@ async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
     throw new Error(`Erreur MCP HTTP ${mcpResponse.status}: ${responseText}`);
   }
 
+  // Traitement du flux SSE renvoyé par SparkyFitnessServer
   const events = responseText.split('\n\n');
   for (const eventBlock of events) {
     const lines = eventBlock.split('\n');
@@ -156,7 +165,6 @@ bot.on('text', async (ctx) => {
     ];
 
     let isDone = false;
-    // On ne code plus le message de succès en dur ! Gemini le génèrera lui-même.
     let finalReply = "Traitement terminé.";
 
     for (let i = 0; i < 6 && !isDone; i++) {
@@ -170,13 +178,14 @@ bot.on('text', async (ctx) => {
       const responseMessage = completion.choices[0].message;
       messages.push(responseMessage);
 
-      // Si Gemini n'appelle plus d'outil, il a généré sa réponse finale (succès ou échec)
+      // Si l'Agent IA (Gemini) n'appelle plus d'outil, le traitement est fini
       if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
         if (responseMessage.content) finalReply = responseMessage.content;
         isDone = true;
         break;
       }
 
+      // Exécution des outils MCP demandés
       for (const toolCall of responseMessage.tool_calls) {
         const parsedArgs = JSON.parse(toolCall.function.arguments);
         console.log(`[MCP] Appel de l'outil ${toolCall.function.name}...`);
@@ -197,7 +206,7 @@ bot.on('text', async (ctx) => {
             console.log(`[Erreur Backend] L'outil ${toolCall.function.name} a renvoyé : ${toolResponseText}`);
           }
 
-          // On donne la VRAIE réponse à l'IA pour qu'elle comprenne ce qu'il s'est passé
+          // Renvoi de la vraie réponse à l'IA
           messages.push({
             role: "tool",
             tool_call_id: toolCall.id,
@@ -218,10 +227,11 @@ bot.on('text', async (ctx) => {
     await ctx.reply(finalReply);
   } catch (error) {
     console.error("Erreur du bot:", error);
-    await ctx.reply("❌ Une erreur est survenue lors de la synchronisation.");
+    await ctx.reply("❌ Une erreur est survenue lors de la synchronisation avec ton journal.");
   }
 });
 
+// Route Webhook pour Telegram
 app.post('/telegram-webhook', async (req, res, next) => {
   try {
     await bot.handleUpdate(req.body);
