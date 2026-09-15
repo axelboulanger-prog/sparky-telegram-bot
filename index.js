@@ -1,7 +1,8 @@
 const express = require('express');
 const { Telegraf } = require('telegraf');
 const OpenAI = require('openai');
-const axios = require('axios'); // <-- Ajout de Axios
+const { Client } = require("@modelcontextprotocol/sdk/client/index.js");
+const { SSEClientTransport } = require("@modelcontextprotocol/sdk/client/sse.js");
 
 const app = express();
 app.use(express.json());
@@ -80,31 +81,52 @@ const tools = [
   }
 ];
 
-// Appel au serveur MCP via Axios pour forcer le respect des headers
-async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
-  try {
-    const response = await axios.post(`${SPARKY_API_URL}/mcp`, {
-      jsonrpc: "2.0",
-      id: toolCallId,
-      method: "tools/call",
-      params: { name: toolName, arguments: parsedArguments }
-    }, {
-      headers: {
-        'Authorization': `Bearer ${SPARKY_API_KEY}`,
-        'Content-Type': 'application/json',
-        'mcp-protocol-version': '2024-11-05',
-        // Contournement de la restriction stricte de l'adaptateur MCP
-        'Accept': 'application/json, text/event-stream'
-      }
-    });
+// Configuration du client MCP
+let mcpClient = null;
 
-    return response.data;
+async function initMCPClient() {
+  if (mcpClient) return mcpClient;
+
+  // L'endpoint MCP de SparkyFitness est monté sur /mcp.
+  // Note: Si le serveur utilise StreamableHTTPServerTransport sur la racine, 
+  // l'URL SSE standard est souvent /sse ou la racine elle-même.
+  const sseUrl = new URL(`${SPARKY_API_URL}/mcp`);
+
+  const transport = new SSEClientTransport(sseUrl, {
+    headers: {
+      'Authorization': `Bearer ${SPARKY_API_KEY}`
+    }
+  });
+
+  const client = new Client(
+    { name: "sparky-telegram-bot", version: "1.0.0" },
+    { capabilities: { tools: {} } }
+  );
+
+  try {
+    await client.connect(transport);
+    console.log("Connecté au serveur MCP SparkyFitness");
+    mcpClient = client;
+    return client;
   } catch (error) {
-    const status = error.response ? error.response.status : 'Unknown';
-    const message = error.response && error.response.data 
-      ? JSON.stringify(error.response.data) 
-      : error.message;
-    throw new Error(`Erreur MCP (${status}): ${message}`);
+    console.error("Échec de la connexion initiale au serveur MCP:", error);
+    throw error;
+  }
+}
+
+async function callSparkyMCP(toolName, parsedArguments) {
+  try {
+    const client = await initMCPClient();
+    const result = await client.callTool({
+      name: toolName,
+      arguments: parsedArguments
+    });
+    return result;
+  } catch (error) {
+    console.error(`Erreur d'appel outil MCP [${toolName}]:`, error);
+    // En cas d'erreur de connexion, on réinitialise le client pour la prochaine tentative
+    mcpClient = null; 
+    throw error;
   }
 }
 
@@ -141,12 +163,14 @@ bot.on('text', async (ctx) => {
       for (const toolCall of responseMessage.tool_calls) {
         const parsedArgs = JSON.parse(toolCall.function.arguments);
         
-        const mcpResult = await callSparkyMCP(toolCall.id, toolCall.function.name, parsedArgs);
+        // On utilise la nouvelle fonction callSparkyMCP qui gère le client MCP
+        const mcpResult = await callSparkyMCP(toolCall.function.name, parsedArgs);
 
         messages.push({
           role: "tool",
           tool_call_id: toolCall.id,
-          content: JSON.stringify(mcpResult.result || mcpResult)
+          // Le SDK renvoie un objet avec une propriété 'content'
+          content: JSON.stringify(mcpResult.content || mcpResult)
         });
 
         if (toolCall.function.name === "sparky_manage_food") {
