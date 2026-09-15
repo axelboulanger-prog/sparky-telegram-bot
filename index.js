@@ -10,7 +10,7 @@ const SPARKY_API_URL = process.env.SPARKY_API_URL;
 const SPARKY_API_KEY = process.env.SPARKY_API_KEY;
 const PORT = process.env.PORT || 8080;
 
-// webhookReply: false est vital pour empêcher Cloud Run de geler le CPU avant la fin
+// webhookReply: false est vital pour empêcher Cloud Run de geler le CPU en mode on-demand
 const bot = new Telegraf(TELEGRAM_TOKEN, {
   telegram: { webhookReply: false }
 });
@@ -20,7 +20,7 @@ const openai = new OpenAI({
   baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/"
 });
 
-// Cache d'idempotence : évite d'insérer 3 fois le même repas si Telegram fait un retry
+// Cache d'idempotence : évite d'insérer 3 fois le même repas si Telegram fait un retry (timeout)
 const processedUpdates = new Set();
 
 const SYSTEM_PROMPT = `Tu es l'assistant nutritionnel personnel de l'utilisateur pour SparkyFitness.
@@ -68,7 +68,7 @@ const tools = [
             items: {
               type: "object",
               properties: {
-                food_name: { type: "string" }, // Clé en snake_case obligatoire
+                food_name: { type: "string" }, // CORRECTION CRITIQUE: snake_case obligatoire pour Zod
                 quantity: { type: "number" },
                 unit: { type: "string" }
               },
@@ -107,9 +107,6 @@ async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
   }
 
   // Le serveur MCP envoie plusieurs blocs séparés par \n\n.
-  // Exemple: 
-  // event: endpoint\ndata: /mcp/session/xxx\n\n
-  // event: message\ndata: {"jsonrpc":"2.0", "result": {...}}\n\n
   const events = responseText.split('\n\n');
   
   for (const eventBlock of events) {
@@ -125,12 +122,12 @@ async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
     if (dataPayload) {
       try {
         const parsed = JSON.parse(dataPayload);
-        // On s'assure qu'on a bien affaire à la réponse RPC et non à une chaîne d'ID de session
+        // On s'assure qu'on a bien affaire à la réponse RPC
         if (parsed.jsonrpc === "2.0") {
           return parsed;
         }
       } catch (e) {
-        // Ignorer les erreurs de parsing pour les événements non-JSON (ex: l'événement 'endpoint')
+        // Ignorer les erreurs de parsing pour les événements non-JSON
       }
     }
   }
@@ -178,7 +175,6 @@ bot.on('text', async (ctx) => {
       const responseMessage = completion.choices[0].message;
       messages.push(responseMessage);
 
-      // Si Gemini n'a plus d'outil à appeler, il a terminé
       if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
         if (responseMessage.content) finalReply = responseMessage.content;
         isDone = true;
@@ -189,10 +185,10 @@ bot.on('text', async (ctx) => {
         const parsedArgs = JSON.parse(toolCall.function.arguments);
         console.log(`[MCP] Appel de l'outil ${toolCall.function.name}...`);
         
-        // Appel à notre API via la méthode d'extraction SSE robuste
+        // Extraction SSE robuste
         const mcpResult = await callSparkyMCP(toolCall.id, toolCall.function.name, parsedArgs);
 
-        // EXTRACTION DU TEXTE BRUT POUR LE LLM
+        // EXTRACTION DU TEXTE BRUT POUR L'IA
         // L'adaptateur MCP de SparkyFitness renvoie: { result: { content: [{ type: 'text', text: "..." }] } }
         let toolResponseText = "";
         if (mcpResult.result && mcpResult.result.content && mcpResult.result.content.length > 0) {
@@ -206,10 +202,9 @@ bot.on('text', async (ctx) => {
         messages.push({
           role: "tool",
           tool_call_id: toolCall.id,
-          content: toolResponseText
+          content: toolResponseText // L'IA lit enfin du texte clair !
         });
 
-        // Dès qu'on loggue la nourriture, on clôture la conversation pour répondre vite à l'utilisateur
         if (toolCall.function.name === "sparky_manage_food") {
           isDone = true;
         }
@@ -234,6 +229,6 @@ app.post('/telegram-webhook', async (req, res, next) => {
   }
 });
 
-app.get('/', (req, res) => res.send('Bot Telegram Sparky avec extracteur SSE corrigé actif !'));
+app.get('/', (req, res) => res.send('Bot Telegram Sparky avec extracteur SSE et Zod corrigés !'));
 
 app.listen(PORT, () => console.log(`Microservice Telegram démarré sur le port ${PORT}`));
