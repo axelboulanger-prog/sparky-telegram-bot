@@ -20,10 +20,10 @@ const openai = new OpenAI({
   baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/"
 });
 
-// Cache d'idempotence : évite les requêtes en double si Telegram timeout
+// Cache d'idempotence : évite d'insérer des doublons si Telegram fait un retry (timeout)
 const processedUpdates = new Set();
 
-// CORRECTION: Mise à jour du prompt pour utiliser les vrais noms d'outils du backend
+// CORRECTION : Le prompt indique à l'IA d'utiliser le bon outil avec la bonne action
 const SYSTEM_PROMPT = `Tu es l'assistant nutritionnel personnel de l'utilisateur pour SparkyFitness.
 Règle stricte de recherche pour ajouter un aliment, tu dois procéder dans cet ordre EXACT :
 1. Utilise 'sparky_manage_favorites' avec l'action 'list_favorites' pour vérifier si l'aliment est dans les favoris.
@@ -32,7 +32,7 @@ Règle stricte de recherche pour ajouter un aliment, tu dois procéder dans cet 
 4. Une fois trouvé, utilise 'sparky_manage_food' pour l'ajouter avec la bonne quantité.
 Exécute les recherches silencieusement et logue le repas.`;
 
-// CORRECTION: Alignement strict avec les Zod schemas de SparkyFitnessServer
+// CORRECTION : Alignement strict avec les Zod schemas de SparkyFitnessServer
 const tools = [
   {
     type: "function",
@@ -92,7 +92,7 @@ const tools = [
   }
 ];
 
-// Extracteur SSE Stateless (Server-Sent Events) optimisé pour Cloud Run
+// Appel réseau ciblé pour le backend SparkyFitness avec Extracteur SSE robuste
 async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
   const mcpResponse = await fetch(`${SPARKY_API_URL}/mcp`, {
     method: 'POST',
@@ -100,7 +100,7 @@ async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
       'Authorization': `Bearer ${SPARKY_API_KEY}`,
       'Content-Type': 'application/json',
       'mcp-protocol-version': '2024-11-05',
-      'Accept': 'application/json, text/event-stream' 
+      'Accept': 'application/json, text/event-stream'
     },
     body: JSON.stringify({
       jsonrpc: "2.0",
@@ -116,7 +116,7 @@ async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
     throw new Error(`Erreur MCP HTTP ${mcpResponse.status}: ${responseText}`);
   }
 
-  // Extraction propre du JSON encapsulé dans l'EventStream du serveur
+  // Le serveur MCP envoie plusieurs blocs séparés par \n\n.
   const events = responseText.split('\n\n');
   
   for (const eventBlock of events) {
@@ -132,15 +132,17 @@ async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
     if (dataPayload) {
       try {
         const parsed = JSON.parse(dataPayload);
+        // On s'assure qu'on a bien affaire à la réponse RPC
         if (parsed.jsonrpc === "2.0") {
           return parsed;
         }
       } catch (e) {
-        // Ignorer les blocs non-JSON
+        // Ignorer les erreurs de parsing pour les événements non-JSON
       }
     }
   }
 
+  // Fallback au cas où le backend renverrait directement du JSON standard
   try {
     return JSON.parse(responseText);
   } catch (e) {
@@ -151,6 +153,7 @@ async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
 bot.on('text', async (ctx) => {
   const updateId = ctx.update.update_id;
 
+  // Mécanisme d'anti-rebond (Idempotence)
   if (processedUpdates.has(updateId)) return;
   
   processedUpdates.add(updateId);
@@ -182,6 +185,7 @@ bot.on('text', async (ctx) => {
       const responseMessage = completion.choices[0].message;
       messages.push(responseMessage);
 
+      // Si Gemini n'a plus d'outil à appeler, il a terminé
       if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
         if (responseMessage.content) finalReply = responseMessage.content;
         isDone = true;
@@ -192,9 +196,11 @@ bot.on('text', async (ctx) => {
         const parsedArgs = JSON.parse(toolCall.function.arguments);
         console.log(`[MCP] Appel de l'outil ${toolCall.function.name}...`);
         
+        // Extraction SSE robuste
         const mcpResult = await callSparkyMCP(toolCall.id, toolCall.function.name, parsedArgs);
 
-        // EXTRACTION DU TEXTE BRUT POUR L'IA (désencapsulation du tableau 'content')
+        // EXTRACTION DU TEXTE BRUT POUR L'IA
+        // L'adaptateur MCP de SparkyFitness renvoie: { result: { content: [{ type: 'text', text: "..." }] } }
         let toolResponseText = "";
         if (mcpResult.result && mcpResult.result.content && mcpResult.result.content.length > 0) {
           toolResponseText = mcpResult.result.content[0].text;
@@ -207,9 +213,10 @@ bot.on('text', async (ctx) => {
         messages.push({
           role: "tool",
           tool_call_id: toolCall.id,
-          content: toolResponseText 
+          content: toolResponseText // L'IA lit enfin du texte clair !
         });
 
+        // Dès qu'on loggue la nourriture, on clôture la conversation pour répondre vite à l'utilisateur
         if (toolCall.function.name === "sparky_manage_food") {
           isDone = true;
         }
@@ -225,6 +232,7 @@ bot.on('text', async (ctx) => {
 
 app.post('/telegram-webhook', async (req, res, next) => {
   try {
+    // Await garantit que le CPU de Cloud Run reste éveillé tout le long du traitement
     await bot.handleUpdate(req.body);
     if (!res.headersSent) res.sendStatus(200);
   } catch(err) {
@@ -233,6 +241,6 @@ app.post('/telegram-webhook', async (req, res, next) => {
   }
 });
 
-app.get('/', (req, res) => res.send('Bot Telegram Sparky avec outils corrigés !'));
+app.get('/', (req, res) => res.send('Bot Telegram Sparky avec outils 100% alignés !'));
 
 app.listen(PORT, () => console.log(`Microservice Telegram démarré sur le port ${PORT}`));
