@@ -10,7 +10,7 @@ const SPARKY_API_URL = process.env.SPARKY_API_URL;
 const SPARKY_API_KEY = process.env.SPARKY_API_KEY;
 const PORT = process.env.PORT || 8080;
 
-// webhookReply: false force Telegraf à ne pas fermer la requête prématurément.
+// webhookReply: false est vital pour empêcher Cloud Run de geler le CPU avant la fin
 const bot = new Telegraf(TELEGRAM_TOKEN, {
   telegram: { webhookReply: false }
 });
@@ -20,7 +20,7 @@ const openai = new OpenAI({
   baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/"
 });
 
-// Cache en mémoire pour bloquer les retries de Telegram (Idempotence)
+// Cache d'idempotence : évite d'insérer 3 fois le même repas si Telegram fait un retry
 const processedUpdates = new Set();
 
 const SYSTEM_PROMPT = `Tu es l'assistant nutritionnel personnel de l'utilisateur pour SparkyFitness.
@@ -68,7 +68,7 @@ const tools = [
             items: {
               type: "object",
               properties: {
-                food_name: { type: "string" }, // Clé en snake_case obligatoire
+                food_name: { type: "string" }, // Clé en snake_case imposée par le backend
                 quantity: { type: "number" },
                 unit: { type: "string" }
               },
@@ -82,84 +82,62 @@ const tools = [
   }
 ];
 
-// Appel Stateless ultra-optimisé avec lecture de flux (SSE) multi-lignes
+// Appel réseau ciblé pour le backend SparkyFitness
 async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
-  const abortController = new AbortController();
-
   const mcpResponse = await fetch(`${SPARKY_API_URL}/mcp`, {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${SPARKY_API_KEY}`,
       'Content-Type': 'application/json',
       'mcp-protocol-version': '2024-11-05',
-      'Accept': 'application/json, text/event-stream' 
+      'Accept': 'application/json, text/event-stream' // Requis par le backend
     },
     body: JSON.stringify({
       jsonrpc: "2.0",
       id: toolCallId,
       method: "tools/call",
       params: { name: toolName, arguments: parsedArguments }
-    }),
-    signal: abortController.signal
+    })
   });
 
+  const responseText = await mcpResponse.text();
+
   if (!mcpResponse.ok) {
-    const errText = await mcpResponse.text();
-    throw new Error(`Erreur MCP HTTP ${mcpResponse.status}: ${errText}`);
+    throw new Error(`Erreur MCP HTTP ${mcpResponse.status}: ${responseText}`);
   }
 
-  // Lecture manuelle du flux Server-Sent Events
-  const reader = mcpResponse.body.getReader();
-  const decoder = new TextDecoder('utf-8');
-  let buffer = '';
-
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      
-      buffer += decoder.decode(value, { stream: true });
-      const blocks = buffer.split('\n\n');
-      buffer = blocks.pop() || ''; // Garde le dernier morceau incomplet
-
-      for (const block of blocks) {
-        // Découpe le bloc en lignes pour ignorer "event: message" et cibler "data:"
-        const lines = block.split('\n');
-        for (const line of lines) {
-          if (line.startsWith('data:')) {
-            const dataStr = line.slice(5).trim();
-            try {
-              const parsed = JSON.parse(dataStr);
-              // Dès qu'on reçoit la réponse de notre outil, on coupe la connexion !
-              if (parsed.id === toolCallId) {
-                abortController.abort(); // Tue la connexion pour libérer Cloud Run
-                return parsed;
-              }
-            } catch (e) {
-              // Ignore les erreurs de parsing sur les événements partiels
-            }
-          }
-        }
-      }
-    }
-  } catch (err) {
-    // Une erreur "AbortError" est normale et voulue ici
-    if (err.name !== 'AbortError') {
-      throw err;
-    }
-  } finally {
-    reader.releaseLock();
-  }
+  // Le serveur ferme la connexion, on a tout le texte. 
+  // Extraction du JSON depuis le format SSE (Server-Sent Events) : "data: {...}"
+  const lines = responseText.split('\n');
+  let dataPayload = "";
   
-  throw new Error("Aucune réponse JSON-RPC trouvée dans le flux SSE");
+  for (const line of lines) {
+    if (line.startsWith('data:')) {
+      dataPayload += line.substring(5).trim();
+    }
+  }
+
+  if (dataPayload) {
+    try {
+      return JSON.parse(dataPayload);
+    } catch (e) {
+      throw new Error(`Erreur de parsing JSON de la réponse MCP : ${e.message}`);
+    }
+  }
+
+  // Fallback au cas où le backend renverrait directement du JSON standard
+  try {
+    return JSON.parse(responseText);
+  } catch (e) {
+    throw new Error(`Aucune réponse JSON-RPC trouvée.\nPayload reçu: ${responseText}`);
+  }
 }
 
 bot.on('text', async (ctx) => {
   const updateId = ctx.update.update_id;
 
-  if (processedUpdates.has(updateId)) {
-    return; // Ignore les retries de Telegram
-  }
+  // Mécanisme d'anti-rebond (Idempotence)
+  if (processedUpdates.has(updateId)) return;
   
   processedUpdates.add(updateId);
   if (processedUpdates.size > 500) {
@@ -190,6 +168,7 @@ bot.on('text', async (ctx) => {
       const responseMessage = completion.choices[0].message;
       messages.push(responseMessage);
 
+      // Si Gemini n'a plus d'outil à appeler, il a terminé
       if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
         if (responseMessage.content) finalReply = responseMessage.content;
         isDone = true;
@@ -198,9 +177,9 @@ bot.on('text', async (ctx) => {
 
       for (const toolCall of responseMessage.tool_calls) {
         const parsedArgs = JSON.parse(toolCall.function.arguments);
-        
         console.log(`[MCP] Appel de l'outil ${toolCall.function.name}...`);
         
+        // Appel à notre API via la méthode simplifiée
         const mcpResult = await callSparkyMCP(toolCall.id, toolCall.function.name, parsedArgs);
 
         messages.push({
@@ -209,6 +188,7 @@ bot.on('text', async (ctx) => {
           content: JSON.stringify(mcpResult.result || mcpResult)
         });
 
+        // Dès qu'on loggue la nourriture, on clôture la conversation pour répondre vite à l'utilisateur
         if (toolCall.function.name === "sparky_manage_food") {
           isDone = true;
         }
@@ -224,7 +204,7 @@ bot.on('text', async (ctx) => {
 
 app.post('/telegram-webhook', async (req, res, next) => {
   try {
-    // Le await bloque Express pour empêcher Cloud Run de geler le CPU en mode gratuit
+    // Await garantit que le CPU de Cloud Run reste éveillé tout le long du traitement
     await bot.handleUpdate(req.body);
     if (!res.headersSent) res.sendStatus(200);
   } catch(err) {
@@ -233,6 +213,6 @@ app.post('/telegram-webhook', async (req, res, next) => {
   }
 });
 
-app.get('/', (req, res) => res.send('Bot Telegram Sparky actif avec Stream SSE Abort !'));
+app.get('/', (req, res) => res.send('Bot Telegram Sparky avec extracteur SSE actif !'));
 
 app.listen(PORT, () => console.log(`Microservice Telegram démarré sur le port ${PORT}`));
