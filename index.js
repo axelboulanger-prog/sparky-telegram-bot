@@ -37,14 +37,15 @@ const processedUpdates = new Set();
 const SYSTEM_PROMPT = `Tu es l'assistant nutritionnel personnel de l'utilisateur pour SparkyFitness.
 Pour ajouter un aliment, procède strictement dans cet ordre :
 1. Utilise 'sparky_manage_favorites' avec l'action 'list_favorites' pour chercher dans les favoris.
-2. Si non trouvé, utilise 'sparky_search_food' pour chercher le produit dans la base.
-3. Utilise 'sparky_manage_food' pour loguer le repas. L'action est généralement 'log_food'.
+2. Si non trouvé, utilise 'sparky_manage_food' avec l'action 'search_food' (paramètre food_name) pour chercher le produit dans la base et récupérer son food_id.
+3. Utilise 'sparky_manage_food' avec l'action 'log_food' pour loguer CHAQUE aliment. Un seul aliment est loggué par appel : si l'utilisateur mentionne plusieurs aliments, appelle 'log_food' une fois par aliment, séquentiellement.
 
-Règle CRUCIALE pour sparky_manage_food : 
-Tu DOIS renseigner le paramètre racine "meal_type" (valeurs acceptées : collation, breakfast, lunch, dinner, snack). Déduis-le de la demande de l'utilisateur ou du moment de la journée.
+Règles CRUCIALES pour sparky_manage_food (action 'log_food') :
+- "food_name" (ou "food_id" si tu l'as trouvé via search_food) est OBLIGATOIRE à la racine de l'appel. Il n'y a PAS de tableau "items" : chaque aliment = un appel séparé avec ses propres food_name/quantity/unit.
+- Le paramètre racine "meal_type" doit être EXACTEMENT l'une de ces valeurs (en anglais, sans accent) : "breakfast", "lunch", "dinner", "snacks". Toute autre valeur (ex: "collation", "goûter", "snack" au singulier) sera rejetée. Traduis toi-même la demande de l'utilisateur vers l'une de ces 4 valeurs (ex: une collation/un goûter -> "snacks").
 
 RÈGLE D'HONNÊTETÉ (ANTI-HALLUCINATION) :
-Analyse le retour de chaque outil. Si un outil renvoie une erreur (ex: MISSING_PARAMS), lis les champs manquants, corrige ton appel et réessaie. 
+Analyse le retour de chaque outil. Si un outil renvoie une erreur (ex: MISSING_PARAMS, meal_type invalide), lis le message d'erreur, corrige ton appel et réessaie. 
 Si après tes tentatives l'outil renvoie toujours une erreur, tu DOIS ARRÊTER LE PROCESSUS. Ne mens jamais. Dis explicitement à l'utilisateur que l'ajout a échoué et donne-lui la raison renvoyée par le système. Ne confirme un succès que si l'outil a renvoyé un statut de réussite réel.`;
 
 // --- MCP Tool Definitions ---
@@ -69,45 +70,50 @@ const tools = [
   {
     type: "function",
     function: {
-      name: "sparky_search_food",
-      description: "Recherche un aliment par mot-clé.",
-      parameters: {
-        type: "object",
-        properties: {
-          query: { type: "string" }
-        },
-        required: ["query"]
-      }
-    }
-  },
-  {
-    type: "function",
-    function: {
       name: "sparky_manage_food",
-      description: "Ajoute l'aliment final dans le journal.",
+      description: "Recherche un aliment (action 'search_food') ou logue UN SEUL aliment dans le journal (action 'log_food'). Pour plusieurs aliments, appelle cet outil plusieurs fois.",
       parameters: {
         type: "object",
         properties: {
-          action: { type: "string", description: "L'action à effectuer (ex: log_food)" },
-          meal_type: { type: "string", description: "Le type de repas cible (ex: collation, breakfast, lunch, dinner, snack)" }, // Placed at root
-          entry_date: { type: "string", description: "Date (YYYY-MM-DD). Utiliser 'today' si c'est pour aujourd'hui." },
-          items: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                food_id: { type: "string" },
-                food_name: { type: "string" },
-                quantity: { type: "number" },
-                unit: { type: "string" }
-              },
-              // Forcing the LLM to provide at least the name, quantity, and unit for each item.
-              // If it found a food_id in a previous step, it should provide that too.
-              required: ["food_name", "quantity", "unit"] 
-            }
+          action: {
+            type: "string",
+            enum: ["search_food", "log_food"],
+            description: "'search_food' pour chercher un food_id par nom, 'log_food' pour loguer un aliment dans le journal."
+          },
+          // -- search_food --
+          food_name: {
+            type: "string",
+            description: "Nom de l'aliment. Requis pour 'search_food' ; requis pour 'log_food' si food_id est absent."
+          },
+          search_type: {
+            type: "string",
+            enum: ["exact", "broad"],
+            description: "Pour 'search_food' : type de recherche (défaut: broad)."
+          },
+          // -- log_food --
+          food_id: {
+            type: "string",
+            description: "UUID de l'aliment (obtenu via 'search_food'). Alternative à food_name pour 'log_food'."
+          },
+          quantity: {
+            type: "number",
+            description: "Quantité consommée (défaut: 1)."
+          },
+          unit: {
+            type: "string",
+            description: "Unité (ex: 'g', 'piece', 'serving'). Défaut: unité de la portion de l'aliment."
+          },
+          meal_type: {
+            type: "string",
+            enum: ["breakfast", "lunch", "dinner", "snacks"],
+            description: "Type de repas cible, requis pour 'log_food'. Valeurs strictes en anglais uniquement."
+          },
+          entry_date: {
+            type: "string",
+            description: "Date (YYYY-MM-DD). Omettre pour aujourd'hui."
           }
         },
-        required: ["action", "meal_type", "items"] // Root parameters required by the backend
+        required: ["action"]
       }
     }
   }
