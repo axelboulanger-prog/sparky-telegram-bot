@@ -10,7 +10,8 @@ const SPARKY_API_URL = process.env.SPARKY_API_URL;
 const SPARKY_API_KEY = process.env.SPARKY_API_KEY;
 const PORT = process.env.PORT || 8080;
 
-// webhookReply: false est vital pour empêcher Cloud Run de geler le CPU avant la fin
+// webhookReply: false est VITAL sur Cloud Run. Cela permet à Express de maintenir 
+// la requête ouverte et d'empêcher le CPU de passer en "throttle" (0%).
 const bot = new Telegraf(TELEGRAM_TOKEN, {
   telegram: { webhookReply: false }
 });
@@ -20,7 +21,7 @@ const openai = new OpenAI({
   baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/"
 });
 
-// Cache d'idempotence : évite d'insérer 3 fois le même repas si Telegram fait un retry
+// Cache d'idempotence : évite d'insérer des doublons dans Neon si Telegram fait un retry
 const processedUpdates = new Set();
 
 const SYSTEM_PROMPT = `Tu es l'assistant nutritionnel personnel de l'utilisateur pour SparkyFitness.
@@ -68,7 +69,7 @@ const tools = [
             items: {
               type: "object",
               properties: {
-                food_name: { type: "string" }, // Clé en snake_case imposée par le backend
+                food_name: { type: "string" }, // CORRECTION CRITIQUE: snake_case obligatoire pour le Zod du backend
                 quantity: { type: "number" },
                 unit: { type: "string" }
               },
@@ -82,7 +83,7 @@ const tools = [
   }
 ];
 
-// Appel réseau ciblé pour le backend SparkyFitness
+// Extracteur SSE Stateless (Server-Sent Events) optimisé pour Cloud Run
 async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
   const mcpResponse = await fetch(`${SPARKY_API_URL}/mcp`, {
     method: 'POST',
@@ -90,7 +91,7 @@ async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
       'Authorization': `Bearer ${SPARKY_API_KEY}`,
       'Content-Type': 'application/json',
       'mcp-protocol-version': '2024-11-05',
-      'Accept': 'application/json, text/event-stream' // Requis par le backend
+      'Accept': 'application/json, text/event-stream' // Requis par le backend SparkyFitness
     },
     body: JSON.stringify({
       jsonrpc: "2.0",
@@ -106,8 +107,9 @@ async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
     throw new Error(`Erreur MCP HTTP ${mcpResponse.status}: ${responseText}`);
   }
 
-  // Le serveur ferme la connexion, on a tout le texte. 
-  // Extraction du JSON depuis le format SSE (Server-Sent Events) : "data: {...}"
+  // Le serveur SparkyFitness utilise StreamableHTTPServerTransport.
+  // Il écrit un flux SSE puis ferme la connexion (200 OK).
+  // Nous extrayons manuellement la ligne contenant le JSON-RPC "data: {...}"
   const lines = responseText.split('\n');
   let dataPayload = "";
   
@@ -125,7 +127,7 @@ async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
     }
   }
 
-  // Fallback au cas où le backend renverrait directement du JSON standard
+  // Fallback au cas où une future mise à jour backend renverrait du JSON standard
   try {
     return JSON.parse(responseText);
   } catch (e) {
@@ -136,7 +138,7 @@ async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
 bot.on('text', async (ctx) => {
   const updateId = ctx.update.update_id;
 
-  // Mécanisme d'anti-rebond (Idempotence)
+  // 1. MÉCANISME D'IDEMPOTENCE
   if (processedUpdates.has(updateId)) return;
   
   processedUpdates.add(updateId);
@@ -168,7 +170,7 @@ bot.on('text', async (ctx) => {
       const responseMessage = completion.choices[0].message;
       messages.push(responseMessage);
 
-      // Si Gemini n'a plus d'outil à appeler, il a terminé
+      // S'il n'y a plus d'appel d'outils, Gemini a fini son raisonnement
       if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
         if (responseMessage.content) finalReply = responseMessage.content;
         isDone = true;
@@ -179,16 +181,26 @@ bot.on('text', async (ctx) => {
         const parsedArgs = JSON.parse(toolCall.function.arguments);
         console.log(`[MCP] Appel de l'outil ${toolCall.function.name}...`);
         
-        // Appel à notre API via la méthode simplifiée
         const mcpResult = await callSparkyMCP(toolCall.id, toolCall.function.name, parsedArgs);
+
+        // 2. EXTRACTION DU TEXTE BRUT POUR LE LLM
+        // L'adaptateur MCP de SparkyFitness renvoie: { result: { content: [{ type: 'text', text: "..." }] } }
+        let toolResponseText = "";
+        if (mcpResult.result && mcpResult.result.content && mcpResult.result.content.length > 0) {
+          toolResponseText = mcpResult.result.content[0].text;
+        } else if (mcpResult.error) {
+          toolResponseText = `Error: ${mcpResult.error.message}`;
+        } else {
+          toolResponseText = JSON.stringify(mcpResult);
+        }
 
         messages.push({
           role: "tool",
           tool_call_id: toolCall.id,
-          content: JSON.stringify(mcpResult.result || mcpResult)
+          content: toolResponseText // On donne le texte clair à Gemini pour qu'il comprenne le résultat
         });
 
-        // Dès qu'on loggue la nourriture, on clôture la conversation pour répondre vite à l'utilisateur
+        // Dès que l'aliment est géré en base Neon, on arrête la boucle
         if (toolCall.function.name === "sparky_manage_food") {
           isDone = true;
         }
@@ -204,7 +216,9 @@ bot.on('text', async (ctx) => {
 
 app.post('/telegram-webhook', async (req, res, next) => {
   try {
-    // Await garantit que le CPU de Cloud Run reste éveillé tout le long du traitement
+    // 3. AWAIT BLOQUANT
+    // Maintient la connexion Express ouverte jusqu'à la fin des requêtes API/Gemini.
+    // Garantit que le CPU de Cloud Run reste éveillé en mode "allocated only during request".
     await bot.handleUpdate(req.body);
     if (!res.headersSent) res.sendStatus(200);
   } catch(err) {
@@ -213,6 +227,6 @@ app.post('/telegram-webhook', async (req, res, next) => {
   }
 });
 
-app.get('/', (req, res) => res.send('Bot Telegram Sparky avec extracteur SSE actif !'));
+app.get('/', (req, res) => res.send('Bot Telegram Sparky avec Extracteur SSE et Cache Idempotent actifs !'));
 
 app.listen(PORT, () => console.log(`Microservice Telegram démarré sur le port ${PORT}`));
