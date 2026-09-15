@@ -10,8 +10,7 @@ const SPARKY_API_URL = process.env.SPARKY_API_URL;
 const SPARKY_API_KEY = process.env.SPARKY_API_KEY;
 const PORT = process.env.PORT || 8080;
 
-// Désactivation de la réponse webhook pour empêcher Cloud Run de geler le CPU
-// La route Express gardera la connexion HTTP ouverte jusqu'à la fin de la requête Gemini + MCP
+// webhookReply: false force Telegraf à ne pas fermer la requête prématurément.
 const bot = new Telegraf(TELEGRAM_TOKEN, {
   telegram: { webhookReply: false }
 });
@@ -69,7 +68,7 @@ const tools = [
             items: {
               type: "object",
               properties: {
-                food_name: { type: "string" }, // Clé corrigée (snake_case pour SparkyFitnessServer)
+                food_name: { type: "string" }, // Clé en snake_case obligatoire
                 quantity: { type: "number" },
                 unit: { type: "string" }
               },
@@ -83,57 +82,78 @@ const tools = [
   }
 ];
 
-// Fonction client MCP gérant proprement le Server-Sent Events (SSE) attendu par SparkyFitnessServer
-async function callSparkyMCP(toolName, parsedArguments) {
-  // Import dynamique pour éviter les conflits ESM/CommonJS sous Node 20
-  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
-  const { SSEClientTransport } = await import('@modelcontextprotocol/sdk/client/sse.js');
+// Appel Stateless ultra-optimisé avec lecture de flux (SSE)
+async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
+  const abortController = new AbortController();
 
-  // L'endpoint racine SSE de SparkyFitnessServer est /mcp
-  const transport = new SSEClientTransport(
-    new URL(`${SPARKY_API_URL}/mcp`),
-    {
-      requestInit: {
-        headers: { 'Authorization': `Bearer ${SPARKY_API_KEY}` }
-      },
-      eventSourceInit: {
-        headers: { 'Authorization': `Bearer ${SPARKY_API_KEY}` }
-      }
-    }
-  );
+  const mcpResponse = await fetch(`${SPARKY_API_URL}/mcp`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${SPARKY_API_KEY}`,
+      'Content-Type': 'application/json',
+      'mcp-protocol-version': '2024-11-05',
+      'Accept': 'application/json, text/event-stream' // Requis par SparkyFitnessServer
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: toolCallId,
+      method: "tools/call",
+      params: { name: toolName, arguments: parsedArguments }
+    }),
+    signal: abortController.signal
+  });
 
-  const mcpClient = new Client(
-    { name: "sparky-telegram-bot", version: "1.0.0" },
-    { capabilities: {} }
-  );
+  if (!mcpResponse.ok) {
+    throw new Error(`Erreur MCP HTTP ${mcpResponse.status}`);
+  }
+
+  // Lecture manuelle du flux Server-Sent Events
+  const reader = mcpResponse.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buffer = '';
 
   try {
-    await mcpClient.connect(transport);
-    
-    // Le SDK Client s'occupe de générer le JSON-RPC "id" en interne
-    const result = await mcpClient.callTool({
-      name: toolName,
-      arguments: parsedArguments
-    });
-    
-    return result;
-  } finally {
-    // Crucial sur Cloud Run : fermer le flux SSE pour libérer la mémoire et le thread
-    try {
-      await transport.close();
-    } catch (err) {
-      console.error("Erreur lors de la fermeture du transport MCP:", err);
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      
+      buffer += decoder.decode(value, { stream: true });
+      const events = buffer.split('\n\n');
+      buffer = events.pop() || ''; // Garde le dernier morceau incomplet
+
+      for (const event of events) {
+        if (event.startsWith('data: ')) {
+          const dataStr = event.slice(6);
+          try {
+            const parsed = JSON.parse(dataStr);
+            // Dès qu'on reçoit la réponse de notre outil, on coupe la connexion !
+            if (parsed.id === toolCallId) {
+              abortController.abort(); // Tue la connexion pour libérer Cloud Run
+              return parsed;
+            }
+          } catch (e) {
+            // Ignore les erreurs de parsing sur les événements partiels
+          }
+        }
+      }
     }
+  } catch (err) {
+    // Une erreur "AbortError" est normale et voulue ici
+    if (err.name !== 'AbortError') {
+      throw err;
+    }
+  } finally {
+    reader.releaseLock();
   }
+  
+  throw new Error("Aucune réponse JSON-RPC trouvée dans le flux SSE");
 }
 
 bot.on('text', async (ctx) => {
   const updateId = ctx.update.update_id;
 
-  // 1. MÉCANISME D'IDEMPOTENCE (ANTI-RETRY)
   if (processedUpdates.has(updateId)) {
-    console.log(`[Anti-Doublon] Update ${updateId} déjà traité par Cloud Run. Ignoré.`);
-    return;
+    return; // Ignore les retries de Telegram
   }
   
   processedUpdates.add(updateId);
@@ -176,14 +196,12 @@ bot.on('text', async (ctx) => {
         
         console.log(`[MCP] Appel de l'outil ${toolCall.function.name}...`);
         
-        // Plus besoin de passer toolCall.id manuellement
-        const mcpResult = await callSparkyMCP(toolCall.function.name, parsedArgs);
+        const mcpResult = await callSparkyMCP(toolCall.id, toolCall.function.name, parsedArgs);
 
-        // Le format natif de contenu de retour MCP
         messages.push({
           role: "tool",
           tool_call_id: toolCall.id,
-          content: JSON.stringify(mcpResult.content || mcpResult)
+          content: JSON.stringify(mcpResult.result || mcpResult)
         });
 
         if (toolCall.function.name === "sparky_manage_food") {
@@ -199,14 +217,10 @@ bot.on('text', async (ctx) => {
   }
 });
 
-const webhookPath = '/telegram-webhook';
-
-app.post(webhookPath, async (req, res, next) => {
+app.post('/telegram-webhook', async (req, res, next) => {
   try {
-    // On attend explicitement la fin du processing. 
-    // Cloud Run garde le CPU alloué car la requête Express reste "active".
+    // Le await bloque Express pour empêcher Cloud Run de geler le CPU en mode gratuit
     await bot.handleUpdate(req.body);
-    
     if (!res.headersSent) res.sendStatus(200);
   } catch(err) {
     console.error("Erreur Webhook:", err);
@@ -214,6 +228,6 @@ app.post(webhookPath, async (req, res, next) => {
   }
 });
 
-app.get('/', (req, res) => res.send('Bot Telegram Sparky avec Gemini Actif et MCP SSE !'));
+app.get('/', (req, res) => res.send('Bot Telegram Sparky actif avec Stream SSE Abort !'));
 
 app.listen(PORT, () => console.log(`Microservice Telegram démarré sur le port ${PORT}`));
