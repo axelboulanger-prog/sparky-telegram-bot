@@ -1,5 +1,5 @@
 const express = require('express');
-const { Telegraf } = require('telegraf');
+const { Telegraf, Markup } = require('telegraf');
 const OpenAI = require('openai');
 
 const app = express();
@@ -34,27 +34,35 @@ const processedUpdates = new Set();
 // --- Per-chat conversation memory ---
 // SparkyFitness's own 'sparky_ask_user' clarification tool is NOT exposed over
 // MCP (an MCP client has no chip UI to render it), so we implement our own
-// local clarification round-trip: when the LLM needs to ask something
-// ("quelle taille de banane ?"), we send the question over Telegram and PAUSE
-// the turn instead of finishing it. The conversation (including the pending
-// tool call/result) is kept here so the user's next message resumes it
-// instead of starting a brand new, context-less request.
+// local clarification round-trip via the ask_user_clarification tool below,
+// PLUS real Telegram inline buttons when the LLM supplies short options.
+//
+// IMPORTANT: we do NOT rely on the LLM always remembering to call that tool.
+// In practice a model sometimes just answers a pending question in plain
+// text instead of calling the tool (observed in production: it asked
+// "quelle taille de banane ?" as plain content, no tool_call). If we only
+// persisted history when the tool was explicitly called, that case would
+// wipe the conversation and the next reply ("Moyenne") would arrive with
+// zero context. So the rule is inverted: ALWAYS persist the conversation
+// after a turn, and only clear it once a diary-mutating action has actually
+// succeeded (or the turn hard-fails after exhausting retries) — see
+// `terminalActionSucceeded` in the agent loop below.
 // Keyed by Telegram chat.id. Expires after CONVERSATION_TTL_MS of inactivity
-// so a forgotten question doesn't linger forever (the instance is also
+// so a forgotten thread doesn't linger forever (the instance is also
 // ephemeral on Cloud Run, so this is best-effort, single-user memory only).
-const conversations = new Map(); // chatId -> { messages: [...], updatedAt: number }
+const conversations = new Map(); // chatId -> { messages: [...], updatedAt: number, pendingOptions?: string[] }
 const CONVERSATION_TTL_MS = 15 * 60 * 1000; // 15 minutes
 
-function getConversation(chatId) {
+function getConversationEntry(chatId) {
   const existing = conversations.get(chatId);
   if (existing && Date.now() - existing.updatedAt < CONVERSATION_TTL_MS) {
-    return existing.messages;
+    return existing;
   }
   return null;
 }
 
-function saveConversation(chatId, messages) {
-  conversations.set(chatId, { messages, updatedAt: Date.now() });
+function saveConversation(chatId, messages, pendingOptions) {
+  conversations.set(chatId, { messages, updatedAt: Date.now(), pendingOptions });
 }
 
 function clearConversation(chatId) {
@@ -82,21 +90,26 @@ CORRIGER OU SUPPRIMER UNE ENTRÉE DÉJÀ LOGUÉE :
 - "qu'est-ce que j'ai mangé aujourd'hui/récemment ?" -> 'sparky_manage_food' action 'list_diary' (entry_date) pour un jour donné, ou 'sparky_get_recent_food_entries' pour les derniers aliments loggués tous jours confondus (utile aussi pour retrouver un aliment déjà utilisé et le relogger).
 - Si l'utilisateur ne précise pas clairement DE QUOI il parle ("supprime ça" sans contexte), demande une clarification plutôt que de deviner.
 
-QUAND DEMANDER UNE CLARIFICATION (outil 'ask_user_clarification') :
-- Le lookup renvoie plusieurs résultats vraiment différents (ex: poulet grillé vs pané) -> pose la question avec les vrais choix trouvés.
-- L'utilisateur donne un compte ("2 bananes", "3 tranches") mais l'aliment trouvé n'a que des unités en grammes/ml -> demande un poids par unité réaliste (ex: options "environ 100g", "environ 150g").
-- N'utilise CET outil QUE dans ces cas. Ne l'utilise PAS pour un détail déductible sans risque (type de repas selon l'heure, date du jour, une seule correspondance claire) : dans ce cas, logue directement, tout de suite, sans demander confirmation.
-- Quand tu appelles 'ask_user_clarification', ARRÊTE-TOI : ne logue rien tant que l'utilisateur n'a pas répondu. Sa prochaine réponse continuera cette même conversation.
-- Si l'utilisateur répond à une question précédente (ex: "150g" ou "grande"), convertis sa réponse en argument correct (ex: quantity/unit) et complète l'appel de log avec TOUS les paramètres requis (pas seulement celui qui vient d'être précisé).
+QUAND ET COMMENT DEMANDER UNE CLARIFICATION — RÈGLE ABSOLUE :
+- Dès qu'il te manque une information pour logger/modifier/supprimer quelque chose EN TOUTE SÉCURITÉ (taille/portion ambiguë, plusieurs aliments correspondants très différents, plusieurs entrées du journal correspondant au même nom, unité incompatible avec ce que l'utilisateur a donné), tu DOIS appeler l'outil 'ask_user_clarification'. C'est INTERDIT de simplement écrire la question en texte libre sans appeler cet outil, même si le message final ressemble à une question — l'utilisateur ne verra pas de boutons cliquables si tu ne passes pas par l'outil, et cela casse le fil de la conversation.
+- Quand il existe un petit nombre de choix clairs (2 à 4), fournis-les TOUJOURS dans le paramètre "options" de l'outil (ex: options: ["Petite (~100g)", "Moyenne (~120g)", "Grosse (~150g)"]) pour qu'ils s'affichent en boutons Telegram. Ne les mets pas seulement dans le texte de la question.
+- N'utilise CET outil QUE quand c'est réellement nécessaire. Ne l'utilise PAS pour un détail déductible sans risque (type de repas selon l'heure, date du jour, une seule correspondance claire) : dans ce cas, logue directement, tout de suite, sans demander confirmation.
+- Quand tu appelles 'ask_user_clarification', ARRÊTE-TOI : ne logue rien tant que l'utilisateur n'a pas répondu. Sa prochaine réponse (qu'il ait tapé du texte ou appuyé sur un bouton) continuera cette même conversation, avec tout le contexte précédent (y compris l'aliment dont vous parliez).
+- Quand l'utilisateur répond à une question précédente (ex: "150g", "grande", ou le clic sur un bouton "Moyenne (~120g)"), convertis sa réponse en argument correct (ex: quantity/unit) et complète l'appel de log avec TOUS les paramètres requis (pas seulement celui qui vient d'être précisé) — ne redemande pas ce que tu sais déjà du contexte.
 
 RÈGLE D'HONNÊTETÉ (ANTI-HALLUCINATION) :
-Analyse le retour de chaque outil. Si une erreur revient (ex: MISSING_PARAMS, meal_type invalide), lis le message, corrige ton appel et réessaie.
+Analyse le retour de chaque outil. Si une erreur revient (ex: MISSING_PARAMS, meal_type invalide, unité/portion non reconnue), lis le message, et si tu peux la corriger seul (ex: reformuler meal_type), corrige et réessaie. Si l'erreur nécessite une info que seul l'utilisateur connaît (ex: taille/portion), utilise 'ask_user_clarification' — n'invente jamais une valeur.
 Si l'outil renvoie toujours une erreur après tes tentatives, ARRÊTE-TOI. Ne mens jamais. Dis explicitement à l'utilisateur que l'ajout a échoué et donne la raison renvoyée par le système. Ne confirme un succès que si l'outil a renvoyé un statut de réussite réel.`;
 
 // --- Local (bot-only) clarification tool ---
 // This name is never sent to SparkyFitness's MCP endpoint — it is intercepted
 // and handled entirely inside the Telegram bot (see the agent loop below).
 const ASK_USER_CLARIFICATION = 'ask_user_clarification';
+
+// Actions that represent a diary mutation actually completing. Once one of
+// these succeeds, the "task" the user asked for is done, and we reset the
+// conversation so the next message starts a fresh, cheap (few-token) turn.
+const TERMINAL_FOOD_ACTIONS = new Set(['log_food', 'log_external_food', 'create_food', 'update_entry', 'delete_entry']);
 
 // --- MCP Tool Definitions ---
 // sparky_manage_food's schema mirrors SparkyFitnessServer's
@@ -123,7 +136,7 @@ const tools = [
     type: "function",
     function: {
       name: "sparky_manage_food",
-      description: "Recherche nutritionnelle (action 'lookup_food_nutrition', cherche dans la base perso incl. Ciqual PUIS la cascade de fournisseurs externes), logue un aliment déjà en base ('log_food'), logue un match externe ('log_external_food'), ou crée un aliment estimé en dernier recours ('create_food'). UN SEUL aliment par appel.",
+      description: "Recherche nutritionnelle (action 'lookup_food_nutrition', cherche dans la base perso incl. Ciqual PUIS la cascade de fournisseurs externes), logue un aliment déjà en base ('log_food'), logue un match externe ('log_external_food'), crée un aliment estimé en dernier recours ('create_food'), ou gère le journal existant ('list_diary', 'delete_entry', 'update_entry'). UN SEUL aliment par appel.",
       parameters: {
         type: "object",
         properties: {
@@ -206,11 +219,16 @@ const tools = [
     type: "function",
     function: {
       name: ASK_USER_CLARIFICATION,
-      description: "Pose une question de clarification à l'utilisateur via Telegram AVANT de logger quoi que ce soit, uniquement quand une info nécessaire est réellement ambiguë. N'utilise JAMAIS cet outil pour un détail déductible sans risque.",
+      description: "Pose une question de clarification à l'utilisateur via Telegram AVANT de logger quoi que ce soit, uniquement quand une info nécessaire est réellement ambiguë. OBLIGATOIRE d'utiliser cet outil (jamais une question en texte libre) dès qu'une clarification est nécessaire.",
       parameters: {
         type: "object",
         properties: {
-          question: { type: "string", description: "La question à poser, en français, avec les options si pertinent (ex: 'Quelle taille de banane ? (petite ~100g / moyenne ~120g / grosse ~150g)')." }
+          question: { type: "string", description: "La question à poser, en français, courte." },
+          options: {
+            type: "array",
+            items: { type: "string" },
+            description: "2 à 4 choix courts affichés comme boutons Telegram (ex: ['Petite (~100g)', 'Moyenne (~120g)', 'Grosse (~150g)']). Fournis ce champ dès qu'un petit nombre d'options discrètes existe."
+          }
         },
         required: ["question"]
       }
@@ -274,6 +292,162 @@ async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
   }
 }
 
+// --- Core agent turn ---
+// Shared by both the plain-text handler and the inline-button (callback_query)
+// handler, so a button tap resumes the exact same conversation/loop as typing
+// an answer would. Returns { replyText, options } — options is set only when
+// the LLM asked a clarification with discrete choices (renders as buttons).
+async function runAgentTurn(chatId, userMessageText) {
+  // Resume a paused/ongoing conversation for this chat if one exists,
+  // otherwise start fresh. See the comment above `conversations` for why we
+  // persist by default rather than only when the ask tool was called.
+  const existing = getConversationEntry(chatId);
+  let messages;
+  if (existing) {
+    messages = existing.messages;
+    messages.push({ role: "user", content: userMessageText });
+  } else {
+    messages = [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: userMessageText }
+    ];
+  }
+
+  let isDone = false;
+  let terminalActionSucceeded = false;
+  let pendingOptions;
+  let finalReply = "Je n'ai pas réussi à terminer cette action après plusieurs tentatives, peux-tu reformuler ?";
+
+  // Agent Loop (Max 6 iterations to prevent infinite loops if the LLM gets stuck)
+  for (let i = 0; i < 6 && !isDone; i++) {
+    const completion = await openai.chat.completions.create({
+      model: "gemini-2.5-flash",
+      messages: messages,
+      tools: tools,
+      tool_choice: "auto"
+    });
+
+    const responseMessage = completion.choices[0].message;
+    messages.push(responseMessage);
+
+    // If there are no tool calls, the LLM has generated its final response.
+    if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
+      if (responseMessage.content) finalReply = responseMessage.content;
+      isDone = true;
+      break;
+    }
+
+    // Execute requested tools sequentially (or you could use Promise.all for parallel execution if tools are independent)
+    for (const toolCall of responseMessage.tool_calls) {
+      let parsedArgs;
+      try {
+         parsedArgs = JSON.parse(toolCall.function.arguments);
+      } catch (e) {
+         console.error(`[Agent MCP] Erreur de parsing JSON pour les arguments de l'outil ${toolCall.function.name}:`, e);
+         messages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: `Error: Invalid JSON arguments format.`
+        });
+        continue; // Skip execution if arguments are unparseable
+      }
+
+      // Local clarification tool: never forwarded to SparkyFitness's MCP.
+      // Send the question over Telegram (as buttons if options were given)
+      // and pause the whole turn so the user's next message/button tap can
+      // resume this exact conversation.
+      if (toolCall.function.name === ASK_USER_CLARIFICATION) {
+        finalReply = parsedArgs.question || "Peux-tu préciser ?";
+        if (Array.isArray(parsedArgs.options) && parsedArgs.options.length > 0) {
+          pendingOptions = parsedArgs.options.slice(0, 4).map(String);
+        }
+        messages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: "Question posée à l'utilisateur. En attente de sa réponse."
+        });
+        isDone = true;
+        break; // Stop processing further tool calls in this turn.
+      }
+
+      console.log(`[Agent MCP] Invocation de ${toolCall.function.name}...`);
+
+      try {
+        const mcpResult = await callSparkyMCP(toolCall.id, toolCall.function.name, parsedArgs);
+
+        let toolResponseText = "";
+        let callFailed = true;
+
+        // The SparkyFitnessServer MCP implementation wraps content in `result.content[0].text`
+        // or sets `isError: true` and includes the error string in the text.
+        if (mcpResult.result && mcpResult.result.content && mcpResult.result.content.length > 0) {
+          toolResponseText = mcpResult.result.content[0].text;
+          callFailed = !!mcpResult.result.isError;
+          if (callFailed) {
+            console.warn(`[Alerte Backend] L'outil ${toolCall.function.name} a renvoyé une erreur logique: ${toolResponseText}`);
+          }
+        } else if (mcpResult.error) {
+          // Handle JSON-RPC level errors
+          toolResponseText = `Error: ${mcpResult.error.message}`;
+          console.error(`[Erreur RPC] L'outil ${toolCall.function.name} a échoué :`, mcpResult.error);
+        } else {
+          toolResponseText = JSON.stringify(mcpResult);
+        }
+
+        // Track whether a diary mutation genuinely completed, so we know
+        // whether to reset the conversation at the end of this turn.
+        if (
+          !callFailed &&
+          toolCall.function.name === 'sparky_manage_food' &&
+          TERMINAL_FOOD_ACTIONS.has(parsedArgs.action)
+        ) {
+          terminalActionSucceeded = true;
+        }
+
+        // Feed the raw API result (success or error) back to the LLM so it can decide the next step
+        messages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: toolResponseText 
+        });
+
+      } catch (mcpError) {
+        console.error(`[Erreur Réseau/MCP] lors de l'appel à ${toolCall.function.name}:`, mcpError);
+        // If the network call failed, tell the LLM so it knows it didn't succeed.
+        messages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: `Error: ${mcpError.message}`
+        });
+      }
+    }
+  }
+
+  // Persist or clear conversation state depending on how the turn ended.
+  // Default is to KEEP the conversation (even a plain, tool-less final reply
+  // might be a question the LLM forgot to route through ask_user_clarification —
+  // see the big comment above `conversations`). We only wipe it once a diary
+  // mutation has actually completed.
+  if (terminalActionSucceeded) {
+    clearConversation(chatId);
+  } else {
+    saveConversation(chatId, messages, pendingOptions);
+  }
+
+  return { replyText: finalReply, options: pendingOptions };
+}
+
+async function sendAgentReply(ctx, chatId, userMessageText) {
+  const { replyText, options } = await runAgentTurn(chatId, userMessageText);
+  if (options && options.length > 0) {
+    await ctx.reply(replyText, Markup.inlineKeyboard(
+      options.map((label, idx) => Markup.button.callback(label, `opt:${idx}`))
+    ));
+  } else {
+    await ctx.reply(replyText);
+  }
+}
+
 // --- Telegram Message Handler ---
 // This is the core logic loop. It receives a message, passes it (plus any
 // pending conversation history) to the LLM, executes any requested tools,
@@ -292,129 +466,53 @@ bot.on('text', async (ctx) => {
   const chatId = ctx.chat.id;
 
   try {
-    const userMessage = ctx.message.text;
     await ctx.sendChatAction('typing');
-
-    // Resume a paused conversation (awaiting an answer to a clarification
-    // question) if one exists for this chat, otherwise start fresh.
-    let messages = getConversation(chatId);
-    if (messages) {
-      messages.push({ role: "user", content: userMessage });
-    } else {
-      messages = [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: userMessage }
-      ];
-    }
-
-    let isDone = false;
-    let awaitingAnswer = false;
-    let finalReply = "Traitement terminé.";
-
-    // Agent Loop (Max 6 iterations to prevent infinite loops if the LLM gets stuck)
-    for (let i = 0; i < 6 && !isDone; i++) {
-      const completion = await openai.chat.completions.create({
-        model: "gemini-2.5-flash",
-        messages: messages,
-        tools: tools,
-        tool_choice: "auto"
-      });
-
-      const responseMessage = completion.choices[0].message;
-      messages.push(responseMessage);
-
-      // If there are no tool calls, the LLM has generated its final response.
-      if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
-        if (responseMessage.content) finalReply = responseMessage.content;
-        isDone = true;
-        break;
-      }
-
-      // Execute requested tools sequentially (or you could use Promise.all for parallel execution if tools are independent)
-      for (const toolCall of responseMessage.tool_calls) {
-        let parsedArgs;
-        try {
-           parsedArgs = JSON.parse(toolCall.function.arguments);
-        } catch (e) {
-           console.error(`[Agent MCP] Erreur de parsing JSON pour les arguments de l'outil ${toolCall.function.name}:`, e);
-           // Feed the JSON parsing error back to the LLM
-           messages.push({
-            role: "tool",
-            tool_call_id: toolCall.id,
-            content: `Error: Invalid JSON arguments format.`
-          });
-          continue; // Skip execution if arguments are unparseable
-        }
-
-        // Local clarification tool: never forwarded to SparkyFitness's MCP.
-        // Send the question over Telegram and pause the whole turn so the
-        // user's next message can resume this exact conversation.
-        if (toolCall.function.name === ASK_USER_CLARIFICATION) {
-          finalReply = parsedArgs.question || "Peux-tu préciser ?";
-          messages.push({
-            role: "tool",
-            tool_call_id: toolCall.id,
-            content: "Question posée à l'utilisateur. En attente de sa réponse."
-          });
-          isDone = true;
-          awaitingAnswer = true;
-          break; // Stop processing further tool calls in this turn.
-        }
-
-        console.log(`[Agent MCP] Invocation de ${toolCall.function.name}...`);
-
-        try {
-          const mcpResult = await callSparkyMCP(toolCall.id, toolCall.function.name, parsedArgs);
-
-          let toolResponseText = "";
-
-          // The SparkyFitnessServer MCP implementation wraps content in `result.content[0].text`
-          // or sets `isError: true` and includes the error string in the text.
-          if (mcpResult.result && mcpResult.result.content && mcpResult.result.content.length > 0) {
-            toolResponseText = mcpResult.result.content[0].text;
-            // The MCP server marks logical failures (like DB constraints or Zod validation) with isError
-            if (mcpResult.result.isError) {
-              console.warn(`[Alerte Backend] L'outil ${toolCall.function.name} a renvoyé une erreur logique: ${toolResponseText}`);
-            }
-          } else if (mcpResult.error) {
-             // Handle JSON-RPC level errors
-            toolResponseText = `Error: ${mcpResult.error.message}`;
-            console.error(`[Erreur RPC] L'outil ${toolCall.function.name} a échoué :`, mcpResult.error);
-          } else {
-            toolResponseText = JSON.stringify(mcpResult);
-          }
-
-          // Feed the raw API result (success or error) back to the LLM so it can decide the next step
-          messages.push({
-            role: "tool",
-            tool_call_id: toolCall.id,
-            content: toolResponseText 
-          });
-
-        } catch (mcpError) {
-          console.error(`[Erreur Réseau/MCP] lors de l'appel à ${toolCall.function.name}:`, mcpError);
-          // If the network call failed, tell the LLM so it knows it didn't succeed.
-          messages.push({
-            role: "tool",
-            tool_call_id: toolCall.id,
-            content: `Error: ${mcpError.message}`
-          });
-        }
-      }
-    }
-
-    // Persist or clear conversation state depending on how the turn ended.
-    if (awaitingAnswer) {
-      saveConversation(chatId, messages); // keep context for the follow-up answer
-    } else {
-      clearConversation(chatId); // action completed (or gave up) — start fresh next time
-    }
-
-    // Send final reply back to Telegram
-    await ctx.reply(finalReply);
-
+    await sendAgentReply(ctx, chatId, ctx.message.text);
   } catch (error) {
     console.error("Erreur fatale du bot:", error);
+    clearConversation(chatId);
+    await ctx.reply("❌ Une erreur technique est survenue lors de la synchronisation avec le cloud SparkyFitness.");
+  }
+});
+
+// --- Inline button handler ---
+// Fires when the user taps one of the buttons rendered from an
+// ask_user_clarification call's "options". We resolve the button back to its
+// label text and feed it into the SAME agent loop as if the user had typed
+// that label, so the LLM sees a normal, contextful answer.
+bot.on('callback_query', async (ctx) => {
+  const updateId = ctx.update.update_id;
+  if (processedUpdates.has(updateId)) return;
+  processedUpdates.add(updateId);
+  if (processedUpdates.size > 500) {
+    processedUpdates.delete(processedUpdates.values().next().value);
+  }
+
+  const chatId = ctx.chat.id;
+  const data = ctx.callbackQuery.data || "";
+
+  try {
+    await ctx.answerCbQuery(); // stop the button's loading spinner
+
+    const entry = getConversationEntry(chatId);
+    const match = /^opt:(\d+)$/.exec(data);
+    if (!entry || !entry.pendingOptions || !match) {
+      await ctx.reply("Cette question n'est plus d'actualité (trop de temps a passé ou une autre action a eu lieu entretemps) — peux-tu reformuler ta demande ?");
+      return;
+    }
+    const chosenLabel = entry.pendingOptions[Number(match[1])];
+    if (chosenLabel === undefined) {
+      await ctx.reply("Option invalide, peux-tu reformuler ?");
+      return;
+    }
+
+    // Remove the keyboard from the original question so it can't be tapped twice.
+    try { await ctx.editMessageReplyMarkup(undefined); } catch (e) { /* message may be too old to edit; ignore */ }
+
+    await ctx.sendChatAction('typing');
+    await sendAgentReply(ctx, chatId, chosenLabel);
+  } catch (error) {
+    console.error("Erreur fatale du bot (callback_query):", error);
     clearConversation(chatId);
     await ctx.reply("❌ Une erreur technique est survenue lors de la synchronisation avec le cloud SparkyFitness.");
   }
