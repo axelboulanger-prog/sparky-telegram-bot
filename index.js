@@ -31,39 +31,91 @@ const openai = new OpenAI({
 // to avoid processing the same message twice (which would result in duplicate LLM calls/food entries).
 const processedUpdates = new Set();
 
-// --- System Prompt ---
-// This is the core instruction set for the LLM. It defines its persona, its workflow,
-// and CRITICALLY, its anti-hallucination constraints.
-const SYSTEM_PROMPT = `Tu es l'assistant nutritionnel personnel de l'utilisateur pour SparkyFitness.
-Pour ajouter un aliment, procède strictement dans cet ordre :
-1. Utilise 'sparky_manage_favorites' avec l'action 'list_favorites' pour chercher dans les favoris.
-2. Si non trouvé, utilise 'sparky_manage_food' avec l'action 'search_food' (paramètre food_name) pour chercher le produit dans la base et récupérer son food_id.
-3. Utilise 'sparky_manage_food' avec l'action 'log_food' pour loguer CHAQUE aliment. Un seul aliment est loggué par appel : si l'utilisateur mentionne plusieurs aliments, appelle 'log_food' une fois par aliment, séquentiellement.
+// --- Per-chat conversation memory ---
+// SparkyFitness's own 'sparky_ask_user' clarification tool is NOT exposed over
+// MCP (an MCP client has no chip UI to render it), so we implement our own
+// local clarification round-trip: when the LLM needs to ask something
+// ("quelle taille de banane ?"), we send the question over Telegram and PAUSE
+// the turn instead of finishing it. The conversation (including the pending
+// tool call/result) is kept here so the user's next message resumes it
+// instead of starting a brand new, context-less request.
+// Keyed by Telegram chat.id. Expires after CONVERSATION_TTL_MS of inactivity
+// so a forgotten question doesn't linger forever (the instance is also
+// ephemeral on Cloud Run, so this is best-effort, single-user memory only).
+const conversations = new Map(); // chatId -> { messages: [...], updatedAt: number }
+const CONVERSATION_TTL_MS = 15 * 60 * 1000; // 15 minutes
 
-Règles CRUCIALES pour sparky_manage_food (action 'log_food') :
-- "food_name" (ou "food_id" si tu l'as trouvé via search_food) est OBLIGATOIRE à la racine de l'appel. Il n'y a PAS de tableau "items" : chaque aliment = un appel séparé avec ses propres food_name/quantity/unit.
-- Le paramètre racine "meal_type" doit être EXACTEMENT l'une de ces valeurs (en anglais, sans accent) : "breakfast", "lunch", "dinner", "snacks". Toute autre valeur (ex: "collation", "goûter", "snack" au singulier) sera rejetée. Traduis toi-même la demande de l'utilisateur vers l'une de ces 4 valeurs (ex: une collation/un goûter -> "snacks").
+function getConversation(chatId) {
+  const existing = conversations.get(chatId);
+  if (existing && Date.now() - existing.updatedAt < CONVERSATION_TTL_MS) {
+    return existing.messages;
+  }
+  return null;
+}
+
+function saveConversation(chatId, messages) {
+  conversations.set(chatId, { messages, updatedAt: Date.now() });
+}
+
+function clearConversation(chatId) {
+  conversations.delete(chatId);
+}
+
+// --- System Prompt ---
+// Mirrors SparkyFitnessServer's own prompts/chatbot-full-food.md workflow,
+// adapted for a client (Telegram/MCP) that has no sparky_ask_user chip UI.
+const SYSTEM_PROMPT = `Tu es l'assistant nutritionnel personnel de l'utilisateur pour SparkyFitness.
+
+RECHERCHE ET LOGGING D'UN ALIMENT — ORDRE OBLIGATOIRE :
+1. 'sparky_manage_favorites' action 'list_favorites' : vérifie d'abord si l'aliment est dans les favoris (raccourci rapide).
+2. OBLIGATOIRE ensuite (sauf si trouvé en favori) : 'sparky_manage_food' action 'lookup_food_nutrition' avec food_name. Ce seul appel cherche déjà, dans l'ordre : ta base perso (y compris tes aliments importés depuis Ciqual), puis la cascade de fournisseurs externes connectés (OpenFoodFacts, base suisse, etc.). Ne saute JAMAIS cette étape, même si tu "connais" les calories d'un aliment courant.
+3. Selon le résultat du lookup :
+   - Source "internal" (trouvé dans la base perso, y compris Ciqual) -> logue avec 'log_food' en utilisant le food_id retourné.
+   - Source externe (openfoodfacts, usda, swiss...) -> logue avec 'log_external_food' (food_name + external_id + provider_type du résultat). Ne mets JAMAIS l'External ID dans food_id.
+   - Aucun résultat trouvé du tout -> seulement dans ce cas, 'create_food' avec des valeurs nutritionnelles estimées le plus précisément possible (jamais 0 par défaut), en incluant meal_type et quantity/unit pour logger directement.
+4. "meal_type" doit être EXACTEMENT l'une de ces valeurs (anglais, sans accent) : "breakfast", "lunch", "dinner", "snacks". Traduis toi-même (une collation/un goûter -> "snacks").
+5. Un seul aliment par appel de log (pas de tableau "items") : plusieurs aliments = plusieurs appels séquentiels.
+
+CORRIGER OU SUPPRIMER UNE ENTRÉE DÉJÀ LOGUÉE :
+- "supprime la banane" -> 'sparky_manage_food' action 'delete_entry' avec food_name (et entry_date si ce n'est pas aujourd'hui). Si l'outil renvoie plusieurs entrées correspondantes (même aliment dans plusieurs repas), utilise 'ask_user_clarification' pour demander lequel, ou précise meal_type si le contexte le permet clairement.
+- "déplace ça au dîner" / "c'était en fait 150g pas 100g" -> 'sparky_manage_food' action 'update_entry' avec food_name (+ entry_date si besoin) et le(s) champ(s) à changer (meal_type et/ou quantity/unit).
+- "qu'est-ce que j'ai mangé aujourd'hui/récemment ?" -> 'sparky_manage_food' action 'list_diary' (entry_date) pour un jour donné, ou 'sparky_get_recent_food_entries' pour les derniers aliments loggués tous jours confondus (utile aussi pour retrouver un aliment déjà utilisé et le relogger).
+- Si l'utilisateur ne précise pas clairement DE QUOI il parle ("supprime ça" sans contexte), demande une clarification plutôt que de deviner.
+
+QUAND DEMANDER UNE CLARIFICATION (outil 'ask_user_clarification') :
+- Le lookup renvoie plusieurs résultats vraiment différents (ex: poulet grillé vs pané) -> pose la question avec les vrais choix trouvés.
+- L'utilisateur donne un compte ("2 bananes", "3 tranches") mais l'aliment trouvé n'a que des unités en grammes/ml -> demande un poids par unité réaliste (ex: options "environ 100g", "environ 150g").
+- N'utilise CET outil QUE dans ces cas. Ne l'utilise PAS pour un détail déductible sans risque (type de repas selon l'heure, date du jour, une seule correspondance claire) : dans ce cas, logue directement, tout de suite, sans demander confirmation.
+- Quand tu appelles 'ask_user_clarification', ARRÊTE-TOI : ne logue rien tant que l'utilisateur n'a pas répondu. Sa prochaine réponse continuera cette même conversation.
+- Si l'utilisateur répond à une question précédente (ex: "150g" ou "grande"), convertis sa réponse en argument correct (ex: quantity/unit) et complète l'appel de log avec TOUS les paramètres requis (pas seulement celui qui vient d'être précisé).
 
 RÈGLE D'HONNÊTETÉ (ANTI-HALLUCINATION) :
-Analyse le retour de chaque outil. Si un outil renvoie une erreur (ex: MISSING_PARAMS, meal_type invalide), lis le message d'erreur, corrige ton appel et réessaie. 
-Si après tes tentatives l'outil renvoie toujours une erreur, tu DOIS ARRÊTER LE PROCESSUS. Ne mens jamais. Dis explicitement à l'utilisateur que l'ajout a échoué et donne-lui la raison renvoyée par le système. Ne confirme un succès que si l'outil a renvoyé un statut de réussite réel.`;
+Analyse le retour de chaque outil. Si une erreur revient (ex: MISSING_PARAMS, meal_type invalide), lis le message, corrige ton appel et réessaie.
+Si l'outil renvoie toujours une erreur après tes tentatives, ARRÊTE-TOI. Ne mens jamais. Dis explicitement à l'utilisateur que l'ajout a échoué et donne la raison renvoyée par le système. Ne confirme un succès que si l'outil a renvoyé un statut de réussite réel.`;
+
+// --- Local (bot-only) clarification tool ---
+// This name is never sent to SparkyFitness's MCP endpoint — it is intercepted
+// and handled entirely inside the Telegram bot (see the agent loop below).
+const ASK_USER_CLARIFICATION = 'ask_user_clarification';
 
 // --- MCP Tool Definitions ---
-// These schemas must match the expectations of the SparkyFitnessServer MCP implementation.
-// Making properties explicitly `required` forces the LLM to provide them.
+// sparky_manage_food's schema mirrors SparkyFitnessServer's
+// ai/tools/schemas/food.ts (manageFoodInput) — only the fields relevant to
+// searching/logging a single food are published here to keep the schema
+// small for a 3B/flash-class model.
 const tools = [
   {
     type: "function",
     function: {
       name: "sparky_manage_favorites",
       description: "Gère les favoris de l'utilisateur. Utilise l'action 'list_favorites' pour récupérer la liste.",
-      parameters: { 
-        type: "object", 
+      parameters: {
+        type: "object",
         properties: {
           action: { type: "string" },
           type: { type: "string" }
-        }, 
-        required: ["action"] 
+        },
+        required: ["action"]
       }
     }
   },
@@ -71,29 +123,38 @@ const tools = [
     type: "function",
     function: {
       name: "sparky_manage_food",
-      description: "Recherche un aliment (action 'search_food') ou logue UN SEUL aliment dans le journal (action 'log_food'). Pour plusieurs aliments, appelle cet outil plusieurs fois.",
+      description: "Recherche nutritionnelle (action 'lookup_food_nutrition', cherche dans la base perso incl. Ciqual PUIS la cascade de fournisseurs externes), logue un aliment déjà en base ('log_food'), logue un match externe ('log_external_food'), ou crée un aliment estimé en dernier recours ('create_food'). UN SEUL aliment par appel.",
       parameters: {
         type: "object",
         properties: {
           action: {
             type: "string",
-            enum: ["search_food", "log_food"],
-            description: "'search_food' pour chercher un food_id par nom, 'log_food' pour loguer un aliment dans le journal."
+            enum: ["lookup_food_nutrition", "log_food", "log_external_food", "create_food", "list_diary", "delete_entry", "update_entry"]
           },
-          // -- search_food --
           food_name: {
             type: "string",
-            description: "Nom de l'aliment. Requis pour 'search_food' ; requis pour 'log_food' si food_id est absent."
+            description: "Nom de l'aliment. Requis pour lookup_food_nutrition/create_food/log_external_food ; requis pour log_food si food_id est absent ; pour delete_entry/update_entry, alternative à entry_id (résolu contre le journal de entry_date)."
           },
-          search_type: {
+          entry_id: {
             type: "string",
-            enum: ["exact", "broad"],
-            description: "Pour 'search_food' : type de recherche (défaut: broad)."
+            description: "UUID de l'entrée du journal. Pour delete_entry/update_entry, alternative à food_name. Le tool te renvoie les candidats si food_name est ambigu (plusieurs entrées du même aliment)."
           },
-          // -- log_food --
+          entry_type: {
+            type: "string",
+            enum: ["food_entry", "food_entry_meal"],
+            description: "Pour delete_entry/update_entry : type d'entrée (défaut: food_entry)."
+          },
+          provider_type: {
+            type: "string",
+            description: "Optionnel : forcer un fournisseur précis (ex: openfoodfacts) pour lookup_food_nutrition/log_external_food."
+          },
           food_id: {
             type: "string",
-            description: "UUID de l'aliment (obtenu via 'search_food'). Alternative à food_name pour 'log_food'."
+            description: "UUID de l'aliment interne (obtenu via lookup_food_nutrition, source 'internal'). Pour log_food uniquement."
+          },
+          external_id: {
+            type: "string",
+            description: "External ID retourné par lookup_food_nutrition pour un match externe. Pour log_external_food uniquement — jamais dans food_id."
           },
           quantity: {
             type: "number",
@@ -101,19 +162,57 @@ const tools = [
           },
           unit: {
             type: "string",
-            description: "Unité (ex: 'g', 'piece', 'serving'). Défaut: unité de la portion de l'aliment."
+            description: "Unité (ex: 'g', 'piece', 'serving'). Vérifie les unités disponibles renvoyées par le lookup."
           },
           meal_type: {
             type: "string",
             enum: ["breakfast", "lunch", "dinner", "snacks"],
-            description: "Type de repas cible, requis pour 'log_food'. Valeurs strictes en anglais uniquement."
+            description: "Type de repas. Requis pour logger. Pour update_entry : NOUVEAU repas cible (ex: déplacer vers 'dinner'). Pour delete_entry : filtre si le même aliment apparaît dans plusieurs repas. Valeurs strictes en anglais uniquement."
           },
           entry_date: {
             type: "string",
-            description: "Date (YYYY-MM-DD). Omettre pour aujourd'hui."
-          }
+            description: "Date (YYYY-MM-DD). Omettre pour aujourd'hui. Pour list_diary : jour à afficher. Pour delete_entry/update_entry : jour du journal où résoudre food_name (pas la nouvelle date)."
+          },
+          calories: { type: "number", description: "Requis pour create_food (kcal)." },
+          protein: { type: "number", description: "Requis pour create_food (g)." },
+          carbs: { type: "number", description: "Requis pour create_food (g)." },
+          fat: { type: "number", description: "Requis pour create_food (g)." },
+          fiber: { type: "number", description: "Optionnel pour create_food (g)." },
+          sugar: { type: "number", description: "Optionnel pour create_food (g)." },
+          sodium: { type: "number", description: "Optionnel pour create_food (mg)." }
         },
         required: ["action"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "sparky_get_recent_food_entries",
+      description: "Liste les aliments récemment loggués par l'utilisateur, tous repas/jours confondus, du plus récent au plus ancien. Utile pour \"relogue comme hier\", \"qu'est-ce que j'ai mangé récemment ?\", ou pour retrouver un food_id déjà utilisé.",
+      parameters: {
+        type: "object",
+        properties: {
+          limit: {
+            type: "number",
+            description: "Nombre d'entrées à retourner (défaut: 10)."
+          }
+        },
+        required: []
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: ASK_USER_CLARIFICATION,
+      description: "Pose une question de clarification à l'utilisateur via Telegram AVANT de logger quoi que ce soit, uniquement quand une info nécessaire est réellement ambiguë. N'utilise JAMAIS cet outil pour un détail déductible sans risque.",
+      parameters: {
+        type: "object",
+        properties: {
+          question: { type: "string", description: "La question à poser, en français, avec les options si pertinent (ex: 'Quelle taille de banane ? (petite ~100g / moyenne ~120g / grosse ~150g)')." }
+        },
+        required: ["question"]
       }
     }
   }
@@ -176,29 +275,40 @@ async function callSparkyMCP(toolCallId, toolName, parsedArguments) {
 }
 
 // --- Telegram Message Handler ---
-// This is the core logic loop. It receives a message, passes it to the LLM,
-// executes any requested tools, feeds the results back to the LLM, and repeats
-// until the LLM provides a final text response.
+// This is the core logic loop. It receives a message, passes it (plus any
+// pending conversation history) to the LLM, executes any requested tools,
+// feeds the results back to the LLM, and repeats until the LLM provides a
+// final text response OR asks the user a clarifying question.
 bot.on('text', async (ctx) => {
   const updateId = ctx.update.update_id;
   if (processedUpdates.has(updateId)) return;
-  
+
   processedUpdates.add(updateId);
   // Keep cache size manageable
   if (processedUpdates.size > 500) {
     processedUpdates.delete(processedUpdates.values().next().value);
   }
 
+  const chatId = ctx.chat.id;
+
   try {
     const userMessage = ctx.message.text;
     await ctx.sendChatAction('typing');
 
-    let messages = [
-      { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: userMessage }
-    ];
+    // Resume a paused conversation (awaiting an answer to a clarification
+    // question) if one exists for this chat, otherwise start fresh.
+    let messages = getConversation(chatId);
+    if (messages) {
+      messages.push({ role: "user", content: userMessage });
+    } else {
+      messages = [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: userMessage }
+      ];
+    }
 
     let isDone = false;
+    let awaitingAnswer = false;
     let finalReply = "Traitement terminé.";
 
     // Agent Loop (Max 6 iterations to prevent infinite loops if the LLM gets stuck)
@@ -235,14 +345,29 @@ bot.on('text', async (ctx) => {
           });
           continue; // Skip execution if arguments are unparseable
         }
-        
+
+        // Local clarification tool: never forwarded to SparkyFitness's MCP.
+        // Send the question over Telegram and pause the whole turn so the
+        // user's next message can resume this exact conversation.
+        if (toolCall.function.name === ASK_USER_CLARIFICATION) {
+          finalReply = parsedArgs.question || "Peux-tu préciser ?";
+          messages.push({
+            role: "tool",
+            tool_call_id: toolCall.id,
+            content: "Question posée à l'utilisateur. En attente de sa réponse."
+          });
+          isDone = true;
+          awaitingAnswer = true;
+          break; // Stop processing further tool calls in this turn.
+        }
+
         console.log(`[Agent MCP] Invocation de ${toolCall.function.name}...`);
-        
+
         try {
           const mcpResult = await callSparkyMCP(toolCall.id, toolCall.function.name, parsedArgs);
 
           let toolResponseText = "";
-          
+
           // The SparkyFitnessServer MCP implementation wraps content in `result.content[0].text`
           // or sets `isError: true` and includes the error string in the text.
           if (mcpResult.result && mcpResult.result.content && mcpResult.result.content.length > 0) {
@@ -278,11 +403,19 @@ bot.on('text', async (ctx) => {
       }
     }
 
+    // Persist or clear conversation state depending on how the turn ended.
+    if (awaitingAnswer) {
+      saveConversation(chatId, messages); // keep context for the follow-up answer
+    } else {
+      clearConversation(chatId); // action completed (or gave up) — start fresh next time
+    }
+
     // Send final reply back to Telegram
     await ctx.reply(finalReply);
-    
+
   } catch (error) {
     console.error("Erreur fatale du bot:", error);
+    clearConversation(chatId);
     await ctx.reply("❌ Une erreur technique est survenue lors de la synchronisation avec le cloud SparkyFitness.");
   }
 });
